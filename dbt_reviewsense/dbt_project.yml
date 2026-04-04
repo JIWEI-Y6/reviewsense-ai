@@ -23,3 +23,6 @@ models:
     gold:
       +schema: GOLD
       +materialized: table
+    monitoring:
+      +schema: GOLD
+      +materialized: table

@@ -1,0 +1,106 @@
+version: 2
+
+models:
+  - name: review_anomalies
+    description: >
+      Category-level anomaly detection. Compares current period metrics against
+      rolling baselines using z-scores. Detects: RATING_DROP, SENTIMENT_SHIFT,
+      COMPLAINT_SPIKE, DECLINING_TREND, RANK_DROP.
+    columns:
+      - name: ANOMALY_TYPE
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - RATING_DROP
+                  - SENTIMENT_SHIFT
+                  - COMPLAINT_SPIKE
+                  - DECLINING_TREND
+                  - RANK_DROP
+      - name: DERIVED_CATEGORY
+        tests:
+          - not_null
+      - name: SEVERITY
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - HIGH
+                  - MEDIUM
+                  - LOW
+
+  - name: cross_category_alerts
+    description: >
+      Cross-category theme anomaly detection. Identifies complaint themes
+      spiking across 3+ categories simultaneously.
+    columns:
+      - name: REVIEW_THEME
+        tests:
+          - unique
+          - not_null
+
+  - name: data_quality_checks
+    description: >
+      Pipeline health monitoring. Validates source freshness, row counts,
+      NULL rates, schema integrity, and enrichment coverage.
+    columns:
+      - name: CHECK_NAME
+        tests:
+          - not_null
+      - name: STATUS
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - PASS
+                  - WARN
+                  - FAIL
+
+  - name: emerging_themes
+    description: >
+      Emerging theme detection. Compares recent 3-month theme share vs
+      historical 12-month share to find growing complaint patterns.
+    columns:
+      - name: DERIVED_CATEGORY
+        tests:
+          - not_null
+      - name: REVIEW_THEME
+        tests:
+          - not_null
+      - name: SEVERITY
+        tests:
+          - accepted_values:
+              arguments:
+                values:
+                  - HIGH
+                  - MEDIUM
+                  - LOW
+
+  - name: product_anomalies
+    description: >
+      Product-level anomaly detection for top ASINs (100+ reviews).
+      Detects rating drops and worst-month-ever events.
+    columns:
+      - name: ANOMALY_TYPE
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - PRODUCT_RATING_DROP
+                  - PRODUCT_WORST_MONTH
+      - name: ASIN
+        tests:
+          - not_null
+      - name: SEVERITY
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - HIGH
+                  - MEDIUM
+                  - LOW
