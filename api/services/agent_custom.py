@@ -13,6 +13,7 @@ import json
 import re
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from api.db import get_cursor
 from api.config import settings
 from api.services import tools
@@ -161,49 +162,122 @@ def _plan_tools(question: str) -> list[dict] | None:
 # EXECUTE TOOLS (0 LLM cost for SQL tools)
 # ============================================
 
-def _execute_plan(steps: list[dict]) -> list[dict]:
-    """Execute tools from the plan. Adaptive: skip if dependency returned empty."""
-    results = []
+def _build_execution_waves(steps: list[dict]) -> list[list[int]]:
+    """Group steps into dependency waves for parallel execution.
 
-    for i, step in enumerate(steps):
-        tool_name = step.get("tool")
-        params = step.get("params", {})
-        purpose = step.get("purpose", "")
-        depends_on = step.get("depends_on")
+    Wave 1: all steps with no dependencies (run in parallel)
+    Wave 2: steps that depend on Wave 1 (run in parallel with each other)
+    etc.
+    """
+    waves = []
+    assigned = set()
 
-        # Check dependency
-        if depends_on is not None and depends_on < len(results):
-            dep_result = results[depends_on].get("result")
-            if not dep_result or (isinstance(dep_result, dict) and dep_result.get("error")):
-                results.append({
-                    "tool": tool_name, "result": None,
-                    "purpose": purpose, "status": "skipped (dependency empty)",
-                })
+    while len(assigned) < len(steps):
+        wave = []
+        for i, step in enumerate(steps):
+            if i in assigned:
                 continue
+            dep = step.get("depends_on")
+            if dep is None or dep in assigned:
+                wave.append(i)
 
-        # Execute tool
-        try:
-            if tool_name == "query_analyst":
-                from api.services.analyst import query_analyst
-                result = query_analyst(params.get("question", step.get("params", {}).get("query", "")))
-            elif tool_name in TOOL_REGISTRY:
-                func = TOOL_REGISTRY[tool_name]
-                result = func(**params)
-            else:
-                result = {"error": f"Unknown tool: {tool_name}"}
+        if not wave:  # circular dependency safety — break the cycle
+            remaining = [i for i in range(len(steps)) if i not in assigned]
+            wave = remaining
 
-            results.append({
-                "tool": tool_name, "result": result,
-                "purpose": purpose, "status": "done",
-            })
-        except Exception as e:
-            logger.error(f"Tool {tool_name} failed: {e}")
-            results.append({
-                "tool": tool_name, "result": {"error": str(e)[:200]},
-                "purpose": purpose, "status": "error",
-            })
+        waves.append(wave)
+        assigned.update(wave)
 
-    return results
+    return waves
+
+
+def _execute_single_tool(step: dict) -> dict:
+    """Execute a single tool in its own thread."""
+    tool_name = step.get("tool")
+    params = step.get("params", {})
+    purpose = step.get("purpose", "")
+
+    try:
+        if tool_name == "query_analyst":
+            from api.services.analyst import query_analyst
+            result = query_analyst(params.get("question", params.get("query", "")))
+        elif tool_name in TOOL_REGISTRY:
+            func = TOOL_REGISTRY[tool_name]
+            result = func(**params)
+        else:
+            result = {"error": f"Unknown tool: {tool_name}"}
+
+        return {
+            "tool": tool_name, "result": result,
+            "purpose": purpose, "status": "done",
+        }
+    except Exception as e:
+        logger.error(f"Tool {tool_name} failed: {e}")
+        return {
+            "tool": tool_name, "result": {"error": str(e)[:200]},
+            "purpose": purpose, "status": "error",
+        }
+
+
+def _execute_plan(steps: list[dict]) -> list[dict]:
+    """Execute tools with parallel execution for independent steps.
+
+    Groups steps into waves by dependency. Steps in the same wave
+    run concurrently via ThreadPoolExecutor. Steps in later waves
+    wait for their dependencies to complete.
+
+    Adaptive: if a dependency returned empty/error, dependent steps are skipped.
+    """
+    waves = _build_execution_waves(steps)
+    all_results = [None] * len(steps)
+
+    for wave_num, wave in enumerate(waves):
+        # Determine which steps in this wave can actually run
+        runnable = []
+        for step_idx in wave:
+            step = steps[step_idx]
+            dep = step.get("depends_on")
+
+            # Check if dependency is satisfied
+            if dep is not None and dep < len(all_results) and all_results[dep] is not None:
+                dep_result = all_results[dep].get("result")
+                if not dep_result or (isinstance(dep_result, dict) and dep_result.get("error")):
+                    all_results[step_idx] = {
+                        "tool": step.get("tool"), "result": None,
+                        "purpose": step.get("purpose", ""),
+                        "status": "skipped (dependency empty)",
+                        "wave": wave_num + 1,
+                    }
+                    continue
+
+            runnable.append(step_idx)
+
+        if not runnable:
+            continue
+
+        # Single tool — no need for thread overhead
+        if len(runnable) == 1:
+            idx = runnable[0]
+            result = _execute_single_tool(steps[idx])
+            result["wave"] = wave_num + 1
+            all_results[idx] = result
+            continue
+
+        # Multiple tools — run in parallel
+        logger.info(f"Wave {wave_num + 1}: running {len(runnable)} tools in parallel")
+        with ThreadPoolExecutor(max_workers=min(len(runnable), 4)) as executor:
+            futures = {}
+            for step_idx in runnable:
+                future = executor.submit(_execute_single_tool, steps[step_idx])
+                futures[future] = step_idx
+
+            for future in as_completed(futures):
+                idx = futures[future]
+                result = future.result()
+                result["wave"] = wave_num + 1
+                all_results[idx] = result
+
+    return [r for r in all_results if r is not None]
 
 
 # ============================================
