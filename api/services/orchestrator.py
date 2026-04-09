@@ -240,33 +240,21 @@ def route_query(question: str, conversation_history=None, session_context=None) 
             result["latency_ms"] = round((time.time() - start) * 1000, 1)
         return result
 
+    # Try custom agent loop first (our tools), then legacy as fallback
     try:
-        result = query_agent(resolved)
+        from api.services.agent_custom import run_custom_agent
+        result = run_custom_agent(resolved)
 
-        answer_lower = (result.get("answer") or "").lower()
-
-        # Edge case: agent returned an error message
-        if result.get("answer", "").startswith("Agent error"):
-            logger.warning(f"Agent error, falling back to legacy: {result['answer'][:100]}")
-            result = _legacy_route(question, conversation_history, session_context)
-            result["fallback"] = True
-
-        # Edge case: agent returned empty or unhelpful answer
-        elif not result.get("answer") or len(result.get("answer", "").strip()) < 10:
-            logger.warning("Agent returned empty answer, falling back to legacy")
-            result = _legacy_route(question, conversation_history, session_context)
-            result["fallback"] = True
-
-        # Edge case: agent asked for clarification instead of answering
-        elif any(s in answer_lower for s in ["need clarification", "could you specify",
-                                              "what cost you're asking", "can you clarify"]):
-            logger.warning("Agent asked for clarification, falling back to legacy with context")
-            result = _legacy_route(question, conversation_history, session_context)
+        if result and result.get("answer") and len(result["answer"].strip()) > 10:
+            result["fallback"] = False
+        else:
+            logger.warning("Custom agent returned no result, falling back to legacy")
+            result = _legacy_route(resolved, None, None)
             result["fallback"] = True
 
     except Exception as e:
-        logger.error(f"Agent API failed: {e}, falling back to legacy")
-        result = _legacy_route(question, conversation_history, session_context)
+        logger.error(f"Custom agent failed: {e}, falling back to legacy")
+        result = _legacy_route(resolved, None, None)
         result["fallback"] = True
 
     # Output guardrail

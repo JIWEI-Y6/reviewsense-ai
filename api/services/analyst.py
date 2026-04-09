@@ -47,9 +47,13 @@ def query_analyst(question: str) -> dict:
         # Execute the generated SQL to get actual data
         data = None
         if sql:
-            cur = conn.cursor(snowflake.connector.DictCursor)
-            cur.execute(sql)
-            data = cur.fetchall()
+            try:
+                cur = conn.cursor(snowflake.connector.DictCursor)
+                cur.execute(sql)
+                data = cur.fetchall()
+            except Exception as e:
+                answer += f"\n\n(SQL execution error: {str(e)[:100]})"
+                data = None
 
         return {
             "answer": answer,

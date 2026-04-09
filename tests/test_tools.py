@@ -377,5 +377,107 @@ class TestCompareProducts:
         assert len(result["products"]) <= 5
 
 
+class TestVerifyClaims:
+    """Tests for verify_claims tool."""
+
+    def test_verify_known_product(self):
+        from api.services.tools import verify_claims
+        result = verify_claims("B01G8JO5F2")
+        assert "claims" in result
+        assert "trust_score" in result
+        assert "summary" in result
+
+    def test_verify_unknown_product(self):
+        from api.services.tools import verify_claims
+        result = verify_claims("NONEXISTENT999")
+        assert "error" in result
+
+    def test_verify_has_verdicts(self):
+        from api.services.tools import verify_claims
+        result = verify_claims("B01G8JO5F2")
+        if result.get("claims"):
+            for claim in result["claims"]:
+                assert claim["verdict"] in ["CONFIRMED", "DISPUTED", "MIXED", "INSUFFICIENT_DATA", "UNKNOWN", "ERROR"]
+
+
+class TestBrandAnalysis:
+    """Tests for get_brand_analysis and compare_brands tools."""
+
+    def test_known_brand(self):
+        from api.services.tools import get_brand_analysis
+        result = get_brand_analysis("Logitech")
+        assert result is not None
+        assert result["total_reviews"] > 0
+        assert result["avg_rating"] is not None
+
+    def test_unknown_brand(self):
+        from api.services.tools import get_brand_analysis
+        result = get_brand_analysis("NonExistentBrand12345")
+        assert result is None
+
+    def test_brand_has_categories(self):
+        from api.services.tools import get_brand_analysis
+        result = get_brand_analysis("Sony")
+        assert result is not None
+        assert len(result["categories"]) > 0
+
+    def test_brand_has_complaints(self):
+        from api.services.tools import get_brand_analysis
+        result = get_brand_analysis("Logitech")
+        assert result is not None
+        assert "top_complaints" in result
+
+    def test_compare_two_brands(self):
+        from api.services.tools import compare_brands
+        result = compare_brands(["Logitech", "Sony"])
+        assert len(result["brands"]) == 2
+        assert "comparison" in result
+
+    def test_compare_single_brand_error(self):
+        from api.services.tools import compare_brands
+        result = compare_brands(["Logitech"])
+        assert "error" in result
+
+
+class TestFindSimilarProducts:
+    """Tests for find_similar_products tool."""
+
+    def test_known_product(self):
+        from api.services.tools import find_similar_products
+        result = find_similar_products("B01G8JO5F2")
+        assert "similar_products" in result
+        assert "total_also_buy" in result
+
+    def test_unknown_product(self):
+        from api.services.tools import find_similar_products
+        result = find_similar_products("NONEXISTENT999")
+        assert result["similar_products"] == [] or "note" in result
+
+
+class TestPriceValueAnalysis:
+    """Tests for price_value_analysis tool."""
+
+    def test_category_with_prices(self):
+        from api.services.tools import price_value_analysis
+        result = price_value_analysis("headphones_earbuds")
+        assert "price_brackets" in result
+        assert "category" in result
+        assert result["category"] == "headphones_earbuds"
+
+    def test_has_brackets(self):
+        from api.services.tools import price_value_analysis
+        result = price_value_analysis("headphones_earbuds")
+        if result["price_brackets"]:
+            bracket = result["price_brackets"][0]
+            assert "bracket" in bracket
+            assert "avg_rating" in bracket
+            assert "product_count" in bracket
+
+    def test_unknown_category(self):
+        from api.services.tools import price_value_analysis
+        result = price_value_analysis("nonexistent_category")
+        assert result["price_brackets"] == []
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
