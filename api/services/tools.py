@@ -479,3 +479,452 @@ def compare_products(asins: list[str]) -> dict:
         "overall_winner": overall_winner,
         "theme_comparison": theme_comparison,
     }
+
+
+# ============================================
+# TOOL 5: verify_claims
+# ============================================
+
+def verify_claims(asin: str) -> dict:
+    """Compare product metadata feature claims vs actual review evidence.
+
+    For each feature claim in the metadata, searches reviews for evidence
+    and uses CORTEX.COMPLETE to judge if the claim is supported.
+
+    Args:
+        asin: Amazon product ASIN
+
+    Returns:
+        dict with 'product' info, 'claims' list with verdicts, 'overall_trust_score'
+    """
+    # Get product detail (includes features from metadata)
+    product = get_product_detail(asin)
+    if not product or not product.get("features"):
+        return {
+            "error": f"No feature data available for {asin}. Claim verification requires product metadata.",
+            "product": product,
+            "claims": [],
+        }
+
+    # Parse features into individual claims
+    features_raw = product["features"]
+    if isinstance(features_raw, str):
+        claims = [f.strip() for f in features_raw.split("|") if len(f.strip()) > 10][:5]
+    elif isinstance(features_raw, list):
+        claims = [str(f).strip() for f in features_raw if len(str(f).strip()) > 10][:5]
+    else:
+        claims = []
+
+    if not claims:
+        return {"error": "No parseable feature claims found.", "product": product, "claims": []}
+
+    results = []
+    with get_cursor() as cur:
+        for claim in claims:
+            # Search reviews for evidence related to this claim
+            review_results = search_reviews(
+                query=claim[:200],
+                asin=asin,
+                limit=5,
+            )
+
+            review_texts = []
+            for r in review_results.get("results", []):
+                review_texts.append(f"[Rating: {r['rating']}/5] {r['text'][:200]}")
+
+            if not review_texts:
+                results.append({
+                    "claim": claim[:200],
+                    "verdict": "INSUFFICIENT_DATA",
+                    "confidence": 0.0,
+                    "evidence_count": 0,
+                    "summary": "No relevant reviews found to verify this claim.",
+                })
+                continue
+
+            evidence = "\n".join(review_texts)
+
+            # Use COMPLETE to judge the claim
+            prompt = (
+                "You are a claim verification analyst. Compare the manufacturer's claim "
+                "against actual customer reviews.\n\n"
+                f"CLAIM: {claim[:200]}\n\n"
+                f"CUSTOMER REVIEWS:\n{evidence}\n\n"
+                "Respond with ONLY valid JSON (no other text):\n"
+                '{"verdict": "CONFIRMED|DISPUTED|MIXED", '
+                '"confidence": 0.0-1.0, '
+                '"summary": "one sentence explanation"}'
+            )
+
+            try:
+                cur.execute(
+                    "SELECT SNOWFLAKE.CORTEX.COMPLETE(%s, %s)",
+                    ("mistral-large", prompt)
+                )
+                response = cur.fetchone()[0].strip()
+                # Try to parse JSON from response
+                import re as _re
+                json_match = _re.search(r'\{.*\}', response, _re.DOTALL)
+                if json_match:
+                    verdict_data = json.loads(json_match.group(0))
+                    results.append({
+                        "claim": claim[:200],
+                        "verdict": verdict_data.get("verdict", "UNKNOWN"),
+                        "confidence": verdict_data.get("confidence", 0.5),
+                        "evidence_count": len(review_texts),
+                        "summary": verdict_data.get("summary", ""),
+                    })
+                else:
+                    results.append({
+                        "claim": claim[:200],
+                        "verdict": "UNKNOWN",
+                        "confidence": 0.5,
+                        "evidence_count": len(review_texts),
+                        "summary": response[:200],
+                    })
+            except Exception:
+                results.append({
+                    "claim": claim[:200],
+                    "verdict": "ERROR",
+                    "confidence": 0.0,
+                    "evidence_count": len(review_texts),
+                    "summary": "Error during verification.",
+                })
+
+    # Overall trust score
+    verdicts = [r["verdict"] for r in results]
+    confirmed = verdicts.count("CONFIRMED")
+    disputed = verdicts.count("DISPUTED")
+    total = len(verdicts)
+    trust_score = confirmed / total if total > 0 else 0
+
+    return {
+        "product": {
+            "asin": product["asin"],
+            "name": product.get("product_name"),
+            "brand": product.get("brand"),
+        },
+        "claims": results,
+        "trust_score": round(trust_score, 2),
+        "summary": {
+            "total_claims": total,
+            "confirmed": confirmed,
+            "disputed": disputed,
+            "mixed": verdicts.count("MIXED"),
+            "insufficient_data": verdicts.count("INSUFFICIENT_DATA"),
+        },
+    }
+
+
+# ============================================
+# TOOL 6: get_brand_analysis + compare_brands
+# ============================================
+
+def get_brand_analysis(brand: str) -> dict | None:
+    """Get brand-level stats: product count, avg rating, sentiment, categories, top products.
+
+    Queries CURATED.PRODUCT_METADATA + GOLD.ENRICHED_REVIEWS aggregated by brand.
+
+    Args:
+        brand: Brand name (case-insensitive partial match)
+
+    Returns:
+        dict with brand stats, top products, category breakdown, or None if not found
+    """
+    with get_cursor() as cur:
+        # Brand overview from metadata + reviews
+        cur.execute("""
+            SELECT
+                m.BRAND,
+                COUNT(DISTINCT m.ASIN) AS total_products,
+                COUNT(DISTINCT r.REVIEW_ID) AS total_reviews,
+                ROUND(AVG(r.RATING), 2) AS avg_rating,
+                ROUND(AVG(r.SENTIMENT_SCORE), 4) AS avg_sentiment,
+                ROUND(COUNT(CASE WHEN r.RATING <= 2 THEN 1 END)::FLOAT /
+                    NULLIF(COUNT(r.REVIEW_ID), 0), 4) AS negative_rate,
+                ROUND(AVG(m.PRICE), 2) AS avg_price,
+                MIN(m.PRICE) AS min_price,
+                MAX(m.PRICE) AS max_price
+            FROM CURATED.PRODUCT_METADATA m
+            LEFT JOIN GOLD.ENRICHED_REVIEWS r ON m.ASIN = r.ASIN
+            WHERE LOWER(m.BRAND) LIKE %s
+            GROUP BY m.BRAND
+            ORDER BY total_reviews DESC
+            LIMIT 1
+        """, (f"%{brand.lower()}%",))
+        overview = cur.fetchone()
+
+        if not overview or not overview[2]:  # no reviews
+            return None
+
+        result = {
+            "brand": overview[0],
+            "total_products": overview[1],
+            "total_reviews": overview[2],
+            "avg_rating": float(overview[3]) if overview[3] else None,
+            "avg_sentiment": float(overview[4]) if overview[4] else None,
+            "negative_rate": float(overview[5]) if overview[5] else None,
+            "price_range": {
+                "avg": float(overview[6]) if overview[6] else None,
+                "min": float(overview[7]) if overview[7] else None,
+                "max": float(overview[8]) if overview[8] else None,
+            },
+        }
+
+        # Category breakdown
+        cur.execute("""
+            SELECT p.DERIVED_CATEGORY, COUNT(DISTINCT m.ASIN) AS products,
+                   COUNT(r.REVIEW_ID) AS reviews
+            FROM CURATED.PRODUCT_METADATA m
+            JOIN GOLD.PRODUCT_LOOKUP p ON m.ASIN = p.ASIN
+            LEFT JOIN GOLD.ENRICHED_REVIEWS r ON m.ASIN = r.ASIN
+            WHERE LOWER(m.BRAND) LIKE %s AND p.DERIVED_CATEGORY IS NOT NULL
+            GROUP BY p.DERIVED_CATEGORY
+            ORDER BY reviews DESC
+        """, (f"%{brand.lower()}%",))
+        result["categories"] = [
+            {"category": r[0], "products": r[1], "reviews": r[2]}
+            for r in cur.fetchall()
+        ]
+
+        # Top products by review count
+        cur.execute("""
+            SELECT m.ASIN, m.TITLE, s.REVIEW_COUNT, s.AVG_RATING, s.AVG_SENTIMENT
+            FROM CURATED.PRODUCT_METADATA m
+            JOIN GOLD.PRODUCT_SENTIMENT_SUMMARY s ON m.ASIN = s.ASIN
+            WHERE LOWER(m.BRAND) LIKE %s
+            ORDER BY s.REVIEW_COUNT DESC
+            LIMIT 5
+        """, (f"%{brand.lower()}%",))
+        result["top_products"] = [
+            {"asin": r[0], "title": r[1][:100] if r[1] else None,
+             "review_count": r[2], "avg_rating": float(r[3]), "avg_sentiment": float(r[4])}
+            for r in cur.fetchall()
+        ]
+
+        # Top complaint themes
+        cur.execute("""
+            SELECT r.REVIEW_THEME, COUNT(*) AS cnt,
+                   ROUND(AVG(r.SENTIMENT_SCORE), 3) AS avg_sent
+            FROM GOLD.ENRICHED_REVIEWS r
+            JOIN CURATED.PRODUCT_METADATA m ON r.ASIN = m.ASIN
+            WHERE LOWER(m.BRAND) LIKE %s AND r.RATING <= 2
+            GROUP BY r.REVIEW_THEME
+            ORDER BY cnt DESC
+            LIMIT 5
+        """, (f"%{brand.lower()}%",))
+        result["top_complaints"] = [
+            {"theme": r[0], "count": r[1], "avg_sentiment": float(r[2])}
+            for r in cur.fetchall()
+        ]
+
+        return result
+
+
+def compare_brands(brands: list[str]) -> dict:
+    """Compare 2-4 brands side by side.
+
+    Args:
+        brands: List of brand names to compare
+
+    Returns:
+        dict with brand profiles, comparison metrics, and winner per metric
+    """
+    if len(brands) < 2:
+        return {"error": "Need at least 2 brands to compare", "brands": []}
+    if len(brands) > 4:
+        brands = brands[:4]
+
+    profiles = []
+    for brand in brands:
+        analysis = get_brand_analysis(brand)
+        if analysis:
+            profiles.append(analysis)
+
+    if len(profiles) < 2:
+        return {"error": f"Only {len(profiles)} brands found. Need at least 2.", "brands": profiles}
+
+    # Compare key metrics
+    comparison = {}
+    metrics = [
+        ("avg_rating", "higher is better", True),
+        ("avg_sentiment", "higher is better", True),
+        ("negative_rate", "lower is better", False),
+        ("total_reviews", "more data", True),
+        ("total_products", "more products", True),
+    ]
+
+    for metric, desc, higher_better in metrics:
+        values = [{"brand": p["brand"], "value": p.get(metric)} for p in profiles if p.get(metric) is not None]
+        if len(values) >= 2:
+            sorted_v = sorted(values, key=lambda x: x["value"], reverse=higher_better)
+            comparison[metric] = {
+                "description": desc,
+                "best": sorted_v[0],
+                "worst": sorted_v[-1],
+                "values": {v["brand"]: v["value"] for v in values},
+            }
+
+    return {
+        "brands": profiles,
+        "comparison": comparison,
+        "brand_count": len(profiles),
+    }
+
+
+# ============================================
+# TOOL 7: find_similar_products
+# ============================================
+
+def find_similar_products(asin: str, limit: int = 5) -> dict:
+    """Find similar products using also_buy metadata cross-references.
+
+    Args:
+        asin: Source product ASIN
+        limit: Max similar products to return
+
+    Returns:
+        dict with source product info and list of similar products with stats
+    """
+    with get_cursor() as cur:
+        # Get also_buy list from metadata
+        cur.execute("""
+            SELECT ALSO_BUY
+            FROM CURATED.PRODUCT_METADATA
+            WHERE ASIN = %s
+        """, (asin,))
+        row = cur.fetchone()
+
+        if not row or not row[0]:
+            return {
+                "source_asin": asin,
+                "similar_products": [],
+                "note": "No also_buy data available for this product.",
+            }
+
+        also_buy = row[0]  # VARIANT array
+        if isinstance(also_buy, str):
+            also_buy = json.loads(also_buy)
+
+        if not also_buy or not isinstance(also_buy, list):
+            return {"source_asin": asin, "similar_products": [], "note": "No also_buy data."}
+
+        # Get details for similar products that exist in our dataset
+        placeholders = ", ".join(["%s"] * min(len(also_buy), 20))
+        params = also_buy[:20]
+
+        cur.execute(f"""
+            SELECT
+                p.ASIN,
+                COALESCE(p.METADATA_TITLE, p.PRODUCT_NAME) AS PRODUCT_NAME,
+                COALESCE(p.METADATA_BRAND, p.BRAND) AS BRAND,
+                m.PRICE,
+                p.DERIVED_CATEGORY,
+                s.REVIEW_COUNT,
+                s.AVG_RATING,
+                s.AVG_SENTIMENT
+            FROM GOLD.PRODUCT_LOOKUP p
+            LEFT JOIN CURATED.PRODUCT_METADATA m ON p.ASIN = m.ASIN
+            LEFT JOIN GOLD.PRODUCT_SENTIMENT_SUMMARY s ON p.ASIN = s.ASIN
+            WHERE p.ASIN IN ({placeholders})
+            ORDER BY s.REVIEW_COUNT DESC NULLS LAST
+            LIMIT {limit}
+        """, params)
+
+        similar = [
+            {
+                "asin": r[0],
+                "product_name": r[1],
+                "brand": r[2],
+                "price": float(r[3]) if r[3] else None,
+                "category": r[4],
+                "review_count": r[5],
+                "avg_rating": float(r[6]) if r[6] else None,
+                "avg_sentiment": float(r[7]) if r[7] else None,
+            }
+            for r in cur.fetchall()
+        ]
+
+        # Get source product info
+        source = get_product_detail(asin)
+
+        return {
+            "source": {
+                "asin": asin,
+                "name": source.get("product_name") if source else None,
+                "brand": source.get("brand") if source else None,
+            },
+            "similar_products": similar,
+            "total_also_buy": len(also_buy),
+            "matched_in_dataset": len(similar),
+        }
+
+
+# ============================================
+# TOOL 8: price_value_analysis
+# ============================================
+
+def price_value_analysis(category: str) -> dict:
+    """Analyze price vs quality within a category.
+
+    Correlates price brackets with review ratings and sentiment.
+
+    Args:
+        category: Derived category name
+
+    Returns:
+        dict with price brackets, each showing avg rating/sentiment/negative rate
+    """
+    with get_cursor() as cur:
+        cur.execute("""
+            SELECT
+                CASE
+                    WHEN m.PRICE < 15 THEN 'budget (under $15)'
+                    WHEN m.PRICE < 30 THEN 'mid-range ($15-$30)'
+                    WHEN m.PRICE < 60 THEN 'premium ($30-$60)'
+                    WHEN m.PRICE >= 60 THEN 'high-end ($60+)'
+                END AS price_bracket,
+                COUNT(DISTINCT m.ASIN) AS product_count,
+                COUNT(r.REVIEW_ID) AS review_count,
+                ROUND(AVG(r.RATING), 2) AS avg_rating,
+                ROUND(AVG(r.SENTIMENT_SCORE), 4) AS avg_sentiment,
+                ROUND(COUNT(CASE WHEN r.RATING <= 2 THEN 1 END)::FLOAT /
+                    NULLIF(COUNT(r.REVIEW_ID), 0), 4) AS negative_rate,
+                ROUND(MIN(m.PRICE), 2) AS min_price,
+                ROUND(MAX(m.PRICE), 2) AS max_price,
+                ROUND(AVG(m.PRICE), 2) AS avg_price
+            FROM CURATED.PRODUCT_METADATA m
+            JOIN GOLD.PRODUCT_LOOKUP p ON m.ASIN = p.ASIN
+            JOIN GOLD.ENRICHED_REVIEWS r ON m.ASIN = r.ASIN
+            WHERE p.DERIVED_CATEGORY = %s
+              AND m.PRICE IS NOT NULL
+              AND m.PRICE > 0
+            GROUP BY price_bracket
+            ORDER BY avg_price
+        """, (category,))
+
+        brackets = [
+            {
+                "bracket": r[0],
+                "product_count": r[1],
+                "review_count": r[2],
+                "avg_rating": float(r[3]) if r[3] else None,
+                "avg_sentiment": float(r[4]) if r[4] else None,
+                "negative_rate": float(r[5]) if r[5] else None,
+                "price_range": {"min": float(r[6]), "max": float(r[7]), "avg": float(r[8])},
+            }
+            for r in cur.fetchall()
+        ]
+
+        # Best value = highest rating at lowest price bracket
+        best_value = None
+        if brackets:
+            best_value = max(brackets, key=lambda b: (b["avg_rating"] or 0))
+
+        return {
+            "category": category,
+            "price_brackets": brackets,
+            "best_value_bracket": best_value["bracket"] if best_value else None,
+            "total_products_with_price": sum(b["product_count"] for b in brackets),
+            "note": "Only includes products with known prices (38.7% of products have price data).",
+        }

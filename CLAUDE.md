@@ -279,15 +279,35 @@ REVIEWSENSE_DB
 Custom agent loop with purpose-built tools — NOT a wrapper over Snowflake's Agent API.
 COMPLETE plans which tools to call, our code executes them, COMPLETE synthesizes the answer.
 
-**Tools (build order):**
-1. `search_reviews` (enhanced) — Cortex Search with ASIN/rating/theme/category filters
-2. `get_product_detail` — metadata + review stats combined
-3. `search_products` — find products by price/features/brand/category criteria
-4. `compare_products` — side-by-side product comparison
-5. `verify_claims` — compare metadata feature claims vs review reality (differentiator)
-6. `get_brand_analysis` + `compare_brands` — brand-level competitive intelligence
-7. Agent loop — planning + execution + synthesis
-8. Evaluation — unit tests per tool + agent integration tests + 20-30 new eval questions
+**Architecture: Hybrid Plan-then-ReAct**
+- Step 1 (PLAN): COMPLETE sees question + 10 tool descriptions → outputs JSON plan (1 LLM call)
+- Step 2 (EXECUTE): Python runs tools from plan, adapts if results empty (0 LLM calls — pure SQL/Search)
+- Step 3 (SYNTHESIZE): COMPLETE generates grounded answer from all tool results (1 LLM call)
+- Total: 2 LLM calls per query. Safety: max 5 steps, 45s timeout, citation required.
+
+**Tools built (with tests):**
+1. `search_reviews` ✅ — Cortex Search with 7 filters (ASIN, rating, category, theme, quality, verified, limit). 12/12 tests passing.
+2. `get_product_detail` ✅ — 4-table join: product_lookup + product_sentiment + category_sentiment + enriched_reviews. Category comparison deltas. 7/7 tests passing.
+3. `search_products` ✅ — SQL on metadata + gold marts. Filter by price, brand, features, category, rating. Sort by review_count/rating/price/sentiment. 12/12 tests passing.
+4. `compare_products` ✅ — Calls get_product_detail per ASIN. Computes metric deltas, identifies winners, aggregates win counts, theme comparison. 8 tests.
+
+**Tools planned:**
+5. `verify_claims` — EXTRACT_ANSWER + Search + COMPLETE verdict. Compare metadata feature claims vs review reality.
+6. `get_brand_analysis` + `compare_brands` — brand-level competitive intelligence from metadata + reviews.
+7. `find_similar_products` — uses also_buy metadata cross-references.
+8. `price_value_analysis` — price brackets vs sentiment correlation within categories.
+
+**Agent loop (planned):**
+9. Plan-Execute-Synthesize loop in `api/services/agent_custom.py`
+10. Evaluation: unit tests per tool + agent integration tests + 20-30 new eval questions
+
+**Additional features built:**
+- Conversation memory: follow-up detection via keyword signals, session context tracking (products/brands/categories)
+- Question resolution: "Should I get them?" → "Regarding product B01G8JO5F2: Should I get them?"
+- ASIN auto-detection in search queries for product-specific filtering
+- Analyst refusal → semantic search fallback
+- Tool trace display in Streamlit (shows which tools were called, what they returned)
+- Guardrails adapt: skip off-topic check for mid-conversation follow-ups
 
 **What makes this original work:**
 - Tool implementations (SQL + Python logic) — ours
@@ -295,6 +315,7 @@ COMPLETE plans which tools to call, our code executes them, COMPLETE synthesizes
 - Claim verification algorithm — ours
 - Product recommendation matching — ours
 - Brand competitive analysis — ours
+- Conversation memory + session context — ours
 - Snowflake provides: COMPLETE (LLM), Cortex Search, Cortex Analyst
 
 ## Tech Stack
