@@ -1,0 +1,16 @@
+-- Track ingestion runs by category
+-- Shows: when data was loaded, how many rows, unique ASINs per category
+
+{{ config(materialized='table') }}
+
+SELECT
+    SOURCE_CATEGORY,
+    COUNT(*) AS TOTAL_ROWS,
+    COUNT(DISTINCT V:asin::VARCHAR) AS UNIQUE_ASINS,
+    COUNT(DISTINCT V:user_id::VARCHAR) AS UNIQUE_USERS,
+    MIN(LOADED_AT) AS FIRST_LOADED,
+    MAX(LOADED_AT) AS LAST_LOADED,
+    COUNT(DISTINCT SOURCE_FILE) AS SOURCE_FILES
+FROM REVIEWSENSE_DB.RAW.REVIEWS_RAW_V2
+GROUP BY SOURCE_CATEGORY
+ORDER BY TOTAL_ROWS DESC

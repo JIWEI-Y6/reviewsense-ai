@@ -1,9 +1,21 @@
--- Staging view: column renaming, text concat, regex cleaning, timestamp filter
--- Source: ANALYTICS.REVIEWS_FOR_GENAI (183,457 rows)
--- Output: ~183,447 rows (filters bad timestamps with YEAR > 2026)
+-- Staging view: extract from VARIANT, clean, filter, assign quality tiers
+-- Source: RAW.REVIEWS_RAW_V2 (multi-category, VARIANT)
+-- Backward compatible: existing Electronics data produces identical output
 
 WITH source AS (
-    SELECT * FROM {{ source('analytics', 'REVIEWS_FOR_GENAI') }}
+    SELECT
+        V:review_id::VARCHAR AS REVIEW_ID,
+        V:asin::VARCHAR AS ASIN,
+        V:user_id::VARCHAR AS USER_ID,
+        V:rating::NUMBER AS RATING,
+        V:title::VARCHAR AS TITLE,
+        V:review_text::VARCHAR AS REVIEW_TEXT,
+        V:verified_purchase::BOOLEAN AS VERIFIED_PURCHASE,
+        V:helpful_vote::NUMBER AS HELPFUL_VOTE,
+        V:review_ts::TIMESTAMP_NTZ AS REVIEW_TS,
+        V:text_len::NUMBER AS TEXT_LEN,
+        SOURCE_CATEGORY
+    FROM {{ source('raw', 'REVIEWS_RAW_V2') }}
 ),
 
 cleaned AS (
@@ -18,6 +30,7 @@ cleaned AS (
         HELPFUL_VOTE,
         REVIEW_TS,
         TEXT_LEN,
+        SOURCE_CATEGORY,
 
         -- Concat title + text for enrichment
         COALESCE(TITLE, '') || ' ' || COALESCE(REVIEW_TEXT, '') AS REVIEW_TEXT_FULL,
@@ -27,11 +40,11 @@ cleaned AS (
             REGEXP_REPLACE(
                 REGEXP_REPLACE(
                     COALESCE(TITLE, '') || ' ' || COALESCE(REVIEW_TEXT, ''),
-                    '<[^>]+>', ' '           -- Remove HTML tags
+                    '<[^>]+>', ' '
                 ),
-                'https?://\\S+', ' '         -- Remove URLs
+                'https?://\\S+', ' '
             ),
-            '\\s+', ' '                      -- Collapse whitespace
+            '\\s+', ' '
         ) AS REVIEW_TEXT_CLEAN,
 
         -- Review quality tier
@@ -42,7 +55,11 @@ cleaned AS (
         END AS REVIEW_QUALITY
 
     FROM source
-    WHERE YEAR(REVIEW_TS) <= 2026
+    WHERE REVIEW_TEXT IS NOT NULL
+      AND LENGTH(TRIM(REVIEW_TEXT)) >= 20
+      AND RATING BETWEEN 1 AND 5
+      AND REVIEW_TS IS NOT NULL
+      AND YEAR(REVIEW_TS) <= 2026
 )
 
 SELECT * FROM cleaned

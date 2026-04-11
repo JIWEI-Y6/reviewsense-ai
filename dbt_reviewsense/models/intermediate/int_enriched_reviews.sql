@@ -1,12 +1,19 @@
 -- Intermediate: Cortex AI enrichment on staged reviews
--- Materialized as TABLE (LLM functions are expensive — compute once)
--- Source: stg_reviews (~183,447 rows)
--- IMPORTANT: Test on LIMIT 100 first before full run (see int_enriched_reviews_sample.sql)
+-- INCREMENTAL: only enriches NEW reviews (MERGE on REVIEW_ID)
+-- Existing enriched rows are NOT re-processed — saves Cortex credits
+-- Use --full-refresh to rebuild from scratch if needed
 
-{{ config(materialized='table') }}
+{{ config(
+    materialized='incremental',
+    unique_key='REVIEW_ID',
+    incremental_strategy='merge'
+) }}
 
 WITH staged AS (
     SELECT * FROM {{ ref('stg_reviews') }}
+    {% if is_incremental() %}
+    WHERE REVIEW_ID NOT IN (SELECT REVIEW_ID FROM {{ this }})
+    {% endif %}
 )
 
 SELECT
@@ -22,11 +29,12 @@ SELECT
     REVIEW_TS,
     TEXT_LEN,
     REVIEW_QUALITY,
+    SOURCE_CATEGORY,
 
     -- Sentiment score (cheap, run on all rows)
     SNOWFLAKE.CORTEX.SENTIMENT(REVIEW_TEXT_CLEAN) AS SENTIMENT_SCORE,
 
-    -- Theme classification (run on all, but low-quality results should be treated cautiously)
+    -- Theme classification
     SNOWFLAKE.CORTEX.CLASSIFY_TEXT(
         REVIEW_TEXT_CLEAN,
         ['battery_life', 'build_quality', 'sound_quality', 'connectivity',

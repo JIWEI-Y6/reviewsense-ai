@@ -1,0 +1,41 @@
+-- ============================================
+-- MULTI-CATEGORY INGESTION INFRASTRUCTURE
+-- Run this once to set up V2 tables for multi-category support
+-- ============================================
+
+USE ROLE TRAINING_ROLE;
+USE WAREHOUSE REVIEWSENSE_WH;
+USE DATABASE REVIEWSENSE_DB;
+USE SCHEMA RAW;
+
+-- Single raw table for ALL categories' reviews
+-- No per-category tables. SOURCE_CATEGORY column discriminates.
+CREATE TABLE IF NOT EXISTS RAW.REVIEWS_RAW_V2 (
+    V                   VARIANT NOT NULL,
+    SOURCE_CATEGORY     VARCHAR NOT NULL,
+    SOURCE_FILE         VARCHAR,
+    LOADED_AT           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Single raw table for ALL categories' product metadata
+CREATE TABLE IF NOT EXISTS RAW.METADATA_RAW_V2 (
+    V                   VARIANT NOT NULL,
+    SOURCE_CATEGORY     VARCHAR NOT NULL,
+    SOURCE_FILE         VARCHAR,
+    LOADED_AT           TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Internal stage for file uploads
+CREATE STAGE IF NOT EXISTS RAW.INGESTION_STAGE
+    FILE_FORMAT = (TYPE = JSON STRIP_OUTER_ARRAY = FALSE);
+
+-- JSON file format for COPY INTO
+CREATE OR REPLACE FILE FORMAT RAW.INGESTION_JSON_FF
+    TYPE = JSON
+    STRIP_OUTER_ARRAY = FALSE
+    COMPRESSION = AUTO;
+
+-- Verify
+SHOW TABLES LIKE 'REVIEWS_RAW_V2' IN SCHEMA RAW;
+SHOW TABLES LIKE 'METADATA_RAW_V2' IN SCHEMA RAW;
+SHOW STAGES LIKE 'INGESTION_STAGE' IN SCHEMA RAW;

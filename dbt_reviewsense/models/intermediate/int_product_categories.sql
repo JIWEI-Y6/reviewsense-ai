@@ -1,14 +1,21 @@
 -- Derive product categories from review text using Cortex COMPLETE
 -- Only for ASINs with 3+ reviews (meaningful sample)
--- Materialized as TABLE (LLM calls are expensive)
+-- INCREMENTAL: only categorizes NEW ASINs (MERGE on ASIN)
 
-{{ config(materialized='table') }}
+{{ config(
+    materialized='incremental',
+    unique_key='ASIN',
+    incremental_strategy='merge'
+) }}
 
 WITH asin_review_counts AS (
     SELECT
         ASIN,
         COUNT(*) AS REVIEW_COUNT
     FROM {{ ref('stg_reviews') }}
+    {% if is_incremental() %}
+    WHERE ASIN NOT IN (SELECT ASIN FROM {{ this }})
+    {% endif %}
     GROUP BY ASIN
     HAVING COUNT(*) >= 3
 ),

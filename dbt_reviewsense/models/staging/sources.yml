@@ -1,34 +1,31 @@
 version: 2
 
 sources:
+  - name: raw
+    database: REVIEWSENSE_DB
+    schema: RAW
+    tables:
+      - name: REVIEWS_RAW_V2
+        description: >
+          Multi-category review source. VARIANT column with SOURCE_CATEGORY discriminator.
+          Contains Electronics (183K) + any additional categories loaded via ingest_category.py.
+        columns:
+          - name: V
+            description: Raw JSON review data as VARIANT
+          - name: SOURCE_CATEGORY
+            description: Dataset category (e.g., Electronics, Cell_Phones)
+          - name: SOURCE_FILE
+            description: Original filename from COPY INTO
+          - name: LOADED_AT
+            description: Timestamp when row was ingested
+
+  # Legacy source — kept for reference/backward compatibility
   - name: analytics
     database: REVIEWSENSE_DB
     schema: ANALYTICS
     tables:
       - name: REVIEWS_FOR_GENAI
         description: >
-          Primary source. 183,457 deduplicated, typed reviews with TEXT_LEN.
-          Created by teammate (Jiwei). Do NOT modify.
-        columns:
-          - name: REVIEW_ID
-            description: Unique review identifier
-          - name: ASIN
-            description: Amazon product identifier
-          - name: USER_ID
-            description: Reviewer user ID
-          - name: RATING
-            description: Star rating (1-5)
-          - name: TITLE
-            description: Review title
-          - name: REVIEW_TEXT
-            description: Review body text
-          - name: VERIFIED_PURCHASE
-            description: Whether the review is from a verified purchase
-          - name: HELPFUL_VOTE
-            description: Number of helpful votes
-          - name: REVIEW_TS
-            description: Review timestamp (contains some bad future dates)
-          - name: CATEGORY
-            description: Original category field (mostly NULL)
-          - name: TEXT_LEN
-            description: Character length of review text
+          LEGACY: Original Electronics-only source (183K rows).
+          Created by teammate (Jiwei). Kept for backward compatibility.
+          New pipeline uses RAW.REVIEWS_RAW_V2.
