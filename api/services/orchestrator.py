@@ -41,7 +41,12 @@ def _resolve_question_with_context(question: str, conversation_history=None, ses
     followup_signals = ['it', 'they', 'them', 'this', 'that', 'those', 'the same',
                         'how about', 'what about', 'and the', 'also', 'its', 'their']
 
-    is_followup = len(question.split()) < 8 or any(f' {s} ' in f' {q} ' for s in followup_signals)
+    has_signal = any(f' {s} ' in f' {q} ' for s in followup_signals)
+    is_very_short = len(question.split()) <= 3  # "how much?", "is it good?"
+
+    # Only treat as follow-up if it has explicit follow-up signals,
+    # or is extremely short (3 words or less = almost certainly a follow-up)
+    is_followup = has_signal or is_very_short
 
     if not is_followup:
         return question

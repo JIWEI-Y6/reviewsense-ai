@@ -117,8 +117,93 @@ Question: {question}
 JSON plan:"""
 
 
+# Fuzzy tool name mapping — LLM might use variations of our tool names
+TOOL_NAME_ALIASES = {
+    "brand_analysis": "get_brand_analysis",
+    "product_detail": "get_product_detail",
+    "product_details": "get_product_detail",
+    "similar_products": "find_similar_products",
+    "find_similar": "find_similar_products",
+    "price_analysis": "price_value_analysis",
+    "price_value": "price_value_analysis",
+    "review_search": "search_reviews",
+    "reviews": "search_reviews",
+    "products": "search_products",
+    "compare_brand": "compare_brands",
+    "compare_product": "compare_products",
+    "verify_claim": "verify_claims",
+    "analyst": "query_analyst",
+    "cortex_analyst": "query_analyst",
+}
+
+
+def _resolve_tool_name(name: str) -> str | None:
+    """Resolve a tool name from the LLM to our registry, with fuzzy matching."""
+    if not name:
+        return None
+    name = name.strip().lower()
+
+    # Exact match
+    if name in TOOL_REGISTRY or name == "query_analyst":
+        return name
+
+    # Alias match
+    if name in TOOL_NAME_ALIASES:
+        return TOOL_NAME_ALIASES[name]
+
+    # Partial match — strip common prefixes/suffixes
+    stripped = name.replace("get_", "").replace("find_", "").replace("search_", "")
+    for registered in list(TOOL_REGISTRY.keys()) + ["query_analyst"]:
+        if stripped in registered or registered.endswith(stripped):
+            return registered
+
+    return None
+
+
+def _extract_json_from_response(response: str) -> dict | None:
+    """Try multiple strategies to extract JSON from LLM response."""
+    # Strategy 1: Direct JSON parse (response is pure JSON)
+    try:
+        return json.loads(response)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: Extract ```json code block
+    code_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response, re.DOTALL)
+    if code_match:
+        try:
+            return json.loads(code_match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 3: Find JSON object with "steps" key (more targeted than greedy {.*})
+    steps_match = re.search(r'\{[^{}]*"steps"\s*:\s*\[.*?\]\s*[^{}]*\}', response, re.DOTALL)
+    if steps_match:
+        try:
+            return json.loads(steps_match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 4: Greedy match (last resort)
+    greedy_match = re.search(r'\{.*\}', response, re.DOTALL)
+    if greedy_match:
+        try:
+            return json.loads(greedy_match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
 def _plan_tools(question: str) -> list[dict] | None:
-    """Use COMPLETE to plan which tools to call."""
+    """Use COMPLETE to plan which tools to call.
+
+    Resilient to LLM output variations:
+    - Tries multiple JSON extraction strategies
+    - Fuzzy matches tool names
+    - Skips invalid steps instead of rejecting entire plan
+    - Logs raw LLM response for debugging
+    """
     prompt = PLANNING_PROMPT.format(
         tool_descriptions=TOOL_DESCRIPTIONS,
         question=question,
@@ -132,32 +217,50 @@ def _plan_tools(question: str) -> list[dict] | None:
             )
             response = cur.fetchone()[0].strip()
 
-        # Extract JSON from response
-        json_match = re.search(r'\{.*\}', response, re.DOTALL)
-        if not json_match:
-            logger.warning(f"Planning returned no JSON: {response[:200]}")
+        # Log raw response for debugging
+        logger.info(f"Planning LLM response for '{question[:50]}': {response[:300]}")
+
+        # Extract JSON from response (tries 4 strategies)
+        plan = _extract_json_from_response(response)
+        if not plan:
+            logger.warning(f"Could not extract JSON from planning response: {response[:300]}")
             return None
 
-        plan = json.loads(json_match.group(0))
         steps = plan.get("steps", [])
 
         # Validate plan structure
         if not isinstance(steps, list):
             logger.warning(f"Invalid plan: 'steps' is not a list: {type(steps)}")
             return None
-        if not steps or len(steps) > 5:
-            logger.warning(f"Invalid plan: {len(steps) if steps else 0} steps")
+
+        if not steps:
+            logger.warning("Plan has 0 steps")
             return None
 
-        for step in steps:
-            if step.get("tool") not in TOOL_REGISTRY and step.get("tool") != "query_analyst":
-                logger.warning(f"Unknown tool in plan: {step.get('tool')}")
-                return None
+        # Validate and fix individual steps — skip bad ones, keep good ones
+        valid_steps = []
+        for step in steps[:5]:  # Max 5 steps
+            tool_name = step.get("tool", "")
+            resolved_name = _resolve_tool_name(tool_name)
 
-        return steps
+            if resolved_name:
+                step["tool"] = resolved_name  # Normalize the name
+                # LLM might use "arguments", "parameters", "args" instead of "params"
+                if "params" not in step:
+                    step["params"] = step.get("arguments") or step.get("parameters") or step.get("args") or {}
+                valid_steps.append(step)
+            else:
+                logger.warning(f"Skipping unknown tool in plan: '{tool_name}'")
+
+        if not valid_steps:
+            logger.warning(f"No valid tools in plan. Original steps: {[s.get('tool') for s in steps]}")
+            return None
+
+        logger.info(f"Plan validated: {[s['tool'] for s in valid_steps]}")
+        return valid_steps
 
     except Exception as e:
-        logger.error(f"Planning failed: {e}")
+        logger.error(f"Planning failed: {e}", exc_info=True)
         return None
 
 
@@ -181,7 +284,14 @@ def _build_execution_waves(steps: list[dict]) -> list[list[int]]:
             if i in assigned:
                 continue
             dep = step.get("depends_on")
-            if dep is None or dep in assigned:
+            # Handle dep as int, list, or None
+            if isinstance(dep, list):
+                deps_met = all(d in assigned for d in dep)
+            elif dep is not None:
+                deps_met = dep in assigned
+            else:
+                deps_met = True
+            if deps_met:
                 wave.append(i)
 
         if not wave:  # circular dependency safety — break the cycle
@@ -242,16 +352,22 @@ def _execute_plan(steps: list[dict]) -> list[dict]:
             dep = step.get("depends_on")
 
             # Check if dependency is satisfied
-            if dep is not None and dep < len(all_results) and all_results[dep] is not None:
-                dep_result = all_results[dep].get("result")
-                if not dep_result or (isinstance(dep_result, dict) and dep_result.get("error")):
-                    all_results[step_idx] = {
-                        "tool": step.get("tool"), "result": None,
-                        "purpose": step.get("purpose", ""),
-                        "status": "skipped (dependency empty)",
-                        "wave": wave_num + 1,
-                    }
-                    continue
+            deps = dep if isinstance(dep, list) else [dep] if dep is not None else []
+            skip = False
+            for d in deps:
+                if d is not None and d < len(all_results) and all_results[d] is not None:
+                    dep_result = all_results[d].get("result")
+                    if not dep_result or (isinstance(dep_result, dict) and dep_result.get("error")):
+                        all_results[step_idx] = {
+                            "tool": step.get("tool"), "result": None,
+                            "purpose": step.get("purpose", ""),
+                            "status": "skipped (dependency empty)",
+                            "wave": wave_num + 1,
+                        }
+                        skip = True
+                        break
+            if skip:
+                continue
 
             runnable.append(step_idx)
 
