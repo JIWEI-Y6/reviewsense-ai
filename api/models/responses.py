@@ -29,6 +29,7 @@ class QueryResponse(BaseModel):
     tool_trace: list[ToolStep] | None = None
     reflection: Reflection | None = None
     fallback: bool = False
+    cached: bool = False
     latency_ms: float
 
 

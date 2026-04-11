@@ -31,6 +31,7 @@ def query_synthesis(question: str) -> dict:
 
 Be precise and factual. Do not add creative elaboration.
 Combine the quantitative data with specific review examples into a clear answer.
+Refuse to generate offensive, discriminatory, or defamatory content. If reviews contain offensive language, paraphrase rather than quote directly.
 Use the exact numbers from the data. Reference what reviewers actually said.
 Do not invent statistics or reviews not present above."""
 

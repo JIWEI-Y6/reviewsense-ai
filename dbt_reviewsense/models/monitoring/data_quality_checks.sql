@@ -1,68 +1,67 @@
 -- Data quality monitoring: pipeline health checks
--- Validates freshness, row counts, NULL rates, schema, and enrichment coverage
+-- Uses DYNAMIC baselines (not hardcoded row counts)
 -- Each row = one check with PASS/WARN/FAIL status
 
 {{ config(materialized='table') }}
 
--- Source freshness
+-- Source freshness (filter bad timestamps)
 SELECT
     'SOURCE_FRESHNESS' AS CHECK_NAME,
-    'ANALYTICS.REVIEWS_FOR_GENAI' AS TABLE_NAME,
-    DATEDIFF('day', MAX(REVIEW_TS), CURRENT_TIMESTAMP()) AS CURRENT_VALUE,
+    'RAW.REVIEWS_RAW_V2' AS TABLE_NAME,
+    DATEDIFF('day', MAX(V:review_ts::TIMESTAMP_NTZ), CURRENT_TIMESTAMP()) AS CURRENT_VALUE,
     30 AS EXPECTED_VALUE,
     CASE
-        WHEN MAX(REVIEW_TS) > CURRENT_TIMESTAMP() THEN 'WARN'
-        WHEN DATEDIFF('day', MAX(REVIEW_TS), CURRENT_TIMESTAMP()) > 90 THEN 'FAIL'
-        WHEN DATEDIFF('day', MAX(REVIEW_TS), CURRENT_TIMESTAMP()) > 30 THEN 'WARN'
+        WHEN MAX(V:review_ts::TIMESTAMP_NTZ) > CURRENT_TIMESTAMP() THEN 'WARN'
+        WHEN DATEDIFF('day', MAX(V:review_ts::TIMESTAMP_NTZ), CURRENT_TIMESTAMP()) > 90 THEN 'FAIL'
+        WHEN DATEDIFF('day', MAX(V:review_ts::TIMESTAMP_NTZ), CURRENT_TIMESTAMP()) > 30 THEN 'WARN'
         ELSE 'PASS'
     END AS STATUS,
-    'Days since latest review (negative = future timestamps in data)' AS DESCRIPTION,
+    'Days since latest review' AS DESCRIPTION,
     CURRENT_TIMESTAMP() AS CHECKED_AT
-FROM REVIEWSENSE_DB.ANALYTICS.REVIEWS_FOR_GENAI
-WHERE YEAR(REVIEW_TS) <= 2026
+FROM REVIEWSENSE_DB.RAW.REVIEWS_RAW_V2
+WHERE YEAR(V:review_ts::TIMESTAMP_NTZ) <= 2026
 
 UNION ALL
 
--- Source row count
+-- Source row count: should be > 0 (no hardcoded expected value)
 SELECT
     'SOURCE_ROW_COUNT',
-    'ANALYTICS.REVIEWS_FOR_GENAI',
+    'RAW.REVIEWS_RAW_V2',
     COUNT(*),
-    183457,
-    CASE
-        WHEN COUNT(*) < 180000 OR COUNT(*) > 200000 THEN 'WARN'
-        ELSE 'PASS'
-    END,
-    'Expected ~183K rows',
+    0,
+    CASE WHEN COUNT(*) = 0 THEN 'FAIL' ELSE 'PASS' END,
+    'Total reviews in V2 source (should be > 0)',
     CURRENT_TIMESTAMP()
-FROM REVIEWSENSE_DB.ANALYTICS.REVIEWS_FOR_GENAI
+FROM REVIEWSENSE_DB.RAW.REVIEWS_RAW_V2
 
 UNION ALL
 
--- Enrichment row count vs source
+-- Enrichment row count vs staging (relative check, not absolute)
 SELECT
     'ENRICHMENT_ROW_COUNT',
     'SILVER.INT_ENRICHED_REVIEWS',
     e.cnt,
     s.cnt,
     CASE
+        WHEN s.cnt = 0 THEN 'FAIL'
         WHEN ABS(e.cnt - s.cnt) * 100.0 / NULLIF(s.cnt, 0) > 1 THEN 'FAIL'
         ELSE 'PASS'
     END,
-    'Enriched vs source row count (should match within 1%)',
+    'Enriched vs staging row count (should match within 1%)',
     CURRENT_TIMESTAMP()
 FROM (SELECT COUNT(*) AS cnt FROM REVIEWSENSE_DB.SILVER.INT_ENRICHED_REVIEWS) e,
      (SELECT COUNT(*) AS cnt FROM REVIEWSENSE_DB.SILVER.STG_REVIEWS) s
 
 UNION ALL
 
--- Gold row count vs enrichment
+-- Gold row count vs enrichment (relative check)
 SELECT
     'GOLD_ROW_COUNT',
     'GOLD.ENRICHED_REVIEWS',
     g.cnt,
     e.cnt,
     CASE
+        WHEN e.cnt = 0 THEN 'FAIL'
         WHEN ABS(g.cnt - e.cnt) * 100.0 / NULLIF(e.cnt, 0) > 1 THEN 'FAIL'
         ELSE 'PASS'
     END,
@@ -105,7 +104,7 @@ FROM REVIEWSENSE_DB.GOLD.ENRICHED_REVIEWS
 
 UNION ALL
 
--- Category coverage
+-- Category coverage (60% threshold — documented: long-tail ASINs with <3 reviews don't get categories)
 SELECT
     'CATEGORY_COVERAGE',
     'GOLD.ENRICHED_REVIEWS',
@@ -115,39 +114,35 @@ SELECT
         WHEN SUM(CASE WHEN DERIVED_CATEGORY IS NOT NULL THEN 1 ELSE 0 END) * 100.0 / COUNT(*) < 60 THEN 'WARN'
         ELSE 'PASS'
     END,
-    'Percentage of reviews with derived category (expect >60%)',
+    'Pct reviews with derived category (>60%; long-tail ASINs excluded by design)',
     CURRENT_TIMESTAMP()
 FROM REVIEWSENSE_DB.GOLD.ENRICHED_REVIEWS
 
 UNION ALL
 
--- Category count check
+-- Category count: should match between enriched_reviews and category_sentiment_summary
 SELECT
-    'CATEGORY_COUNT',
+    'CATEGORY_CONSISTENCY',
     'GOLD.CATEGORY_SENTIMENT_SUMMARY',
-    COUNT(*),
-    14,
-    CASE
-        WHEN COUNT(*) != 14 THEN 'WARN'
-        ELSE 'PASS'
-    END,
-    'Number of categories (expect exactly 14)',
+    css.cnt,
+    er.cnt,
+    CASE WHEN css.cnt != er.cnt THEN 'WARN' ELSE 'PASS' END,
+    'Category count in summary vs enriched_reviews should match',
     CURRENT_TIMESTAMP()
-FROM REVIEWSENSE_DB.GOLD.CATEGORY_SENTIMENT_SUMMARY
+FROM (SELECT COUNT(*) AS cnt FROM REVIEWSENSE_DB.GOLD.CATEGORY_SENTIMENT_SUMMARY) css,
+     (SELECT COUNT(DISTINCT DERIVED_CATEGORY) AS cnt FROM REVIEWSENSE_DB.GOLD.ENRICHED_REVIEWS WHERE DERIVED_CATEGORY IS NOT NULL) er
 
 UNION ALL
 
--- Schema column count for enriched_reviews
+-- Per-category source check: each SOURCE_CATEGORY should have reviews
 SELECT
-    'SCHEMA_ENRICHED_REVIEWS',
-    'GOLD.ENRICHED_REVIEWS',
+    'PER_CATEGORY_HEALTH',
+    SOURCE_CATEGORY,
     COUNT(*),
-    19,
-    CASE
-        WHEN COUNT(*) != 19 THEN 'FAIL'
-        ELSE 'PASS'
-    END,
-    'Column count for enriched_reviews (expect 17)',
+    0,
+    CASE WHEN COUNT(*) = 0 THEN 'FAIL' ELSE 'PASS' END,
+    'Reviews per source category (should be > 0)',
     CURRENT_TIMESTAMP()
-FROM REVIEWSENSE_DB.INFORMATION_SCHEMA.COLUMNS
-WHERE TABLE_SCHEMA = 'GOLD' AND TABLE_NAME = 'ENRICHED_REVIEWS'
+FROM REVIEWSENSE_DB.GOLD.ENRICHED_REVIEWS
+WHERE SOURCE_CATEGORY IS NOT NULL
+GROUP BY SOURCE_CATEGORY

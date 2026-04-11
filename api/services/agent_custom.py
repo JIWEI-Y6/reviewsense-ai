@@ -23,6 +23,30 @@ logger = logging.getLogger(__name__)
 # Circuit breaker state
 _circuit = {"failures": 0, "open_until": 0, "max_failures": 3, "cooldown": 60}
 
+# Dynamic dataset stats — loaded from Snowflake, cached 1 hour
+_dataset_stats = {"review_count": 183000, "category_count": 14, "loaded_at": 0}
+
+
+def _load_dataset_stats():
+    """Query actual dataset size from gold marts. Cache 1 hour."""
+    now = time.time()
+    if now - _dataset_stats["loaded_at"] < 3600:
+        return
+    try:
+        with get_cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(DISTINCT REVIEW_ID), COUNT(DISTINCT DERIVED_CATEGORY)
+                FROM GOLD.ENRICHED_REVIEWS
+                WHERE DERIVED_CATEGORY IS NOT NULL
+            """)
+            row = cur.fetchone()
+            _dataset_stats["review_count"] = row[0]
+            _dataset_stats["category_count"] = row[1]
+            _dataset_stats["loaded_at"] = now
+            logger.info(f"Dataset stats loaded: {row[0]:,} reviews, {row[1]} categories")
+    except Exception as e:
+        logger.warning(f"Failed to load dataset stats: {e}. Using defaults.")
+
 # Tool registry — maps tool names to functions
 TOOL_REGISTRY = {
     "search_reviews": tools.search_reviews,
@@ -38,14 +62,19 @@ TOOL_REGISTRY = {
 
 TOOL_DESCRIPTIONS = """Available tools:
 1. search_reviews(query, asin?, category?, theme?, min_rating?, max_rating?, verified_only?, quality?, limit?) — Search actual review text. USE FOR: opinions, experiences, complaints, "what do people say".
+   Valid categories: headphones_earbuds, speakers, streaming_devices, smart_home, cables_adapters, chargers_batteries, phone_accessories, computer_peripherals, storage_media, cameras_accessories, tv_accessories, gaming_accessories, wearables, other_electronics
+   Valid themes: battery_life, build_quality, sound_quality, connectivity, comfort, value_for_money, customer_service, durability, ease_of_use, other
 2. get_product_detail(asin) — Get complete product profile: metadata, stats, category comparison, theme breakdown. USE FOR: "tell me about product X", any ASIN reference.
 3. search_products(category?, brand?, min_price?, max_price?, features_contain?, min_rating?, sort_by?, limit?) — Find products by criteria. USE FOR: recommendations, "find me X under $Y".
+   Valid categories: headphones_earbuds, speakers, streaming_devices, smart_home, cables_adapters, chargers_batteries, phone_accessories, computer_peripherals, storage_media, cameras_accessories, tv_accessories, gaming_accessories, wearables, other_electronics
+   sort_by options: review_count, avg_rating, price, avg_sentiment
 4. compare_products(asins) — Side-by-side comparison of 2-5 products. USE FOR: "compare X vs Y".
 5. verify_claims(asin) — Compare metadata feature claims vs actual review evidence. USE FOR: "is the battery really 8 hours?", "are the claims true?".
 6. get_brand_analysis(brand) — Brand-level stats: products, ratings, sentiment, categories, top complaints. USE FOR: "how is brand X?", brand questions.
 7. compare_brands(brands) — Compare 2-4 brands. USE FOR: "brand X vs brand Y".
 8. find_similar_products(asin, limit?) — Find related products via also_buy data. USE FOR: "similar to", "alternatives".
 9. price_value_analysis(category) — Price brackets vs quality within a category. USE FOR: "is paying more worth it?", "best value".
+   Valid categories: headphones_earbuds, speakers, streaming_devices, smart_home, cables_adapters, chargers_batteries, phone_accessories, computer_peripherals, storage_media, cameras_accessories, tv_accessories, gaming_accessories, wearables, other_electronics
 10. query_analyst(question) — Generate SQL via Cortex Analyst for stats questions. USE FOR: category rankings, trends, aggregate counts."""
 
 
@@ -633,6 +662,9 @@ def run_custom_agent(question: str) -> dict:
     - Tier 2: LLM plans tools → execute → synthesize (2 LLM calls)
     """
     start = time.time()
+
+    # Load dynamic dataset stats (cached, 1 hour TTL)
+    _load_dataset_stats()
 
     # Tier 1: Fast path
     fast_result = _try_fast_path(question)

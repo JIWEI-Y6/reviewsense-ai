@@ -3,19 +3,46 @@
 Classifies intent, executes the appropriate path, and builds a tool trace
 that shows which tools were used and what they found.
 
-Edge cases handled:
-- Agent API unreachable → falls back to legacy orchestrator
-- Agent returns empty answer → retry with legacy path
-- Analyst refuses (can't answer) → falls back to semantic search
-- Guardrail blocks input → return 400 before any processing
+Features:
+- Query result caching (5-min TTL, skip for follow-ups)
+- Conversation compaction (summarize old messages, keep recent)
+- Automatic fallback: custom agent → legacy orchestrator
+- Analyst refuses → semantic search fallback
 """
 
 import time
+import hashlib
 import logging
 from api.services.agent import query_agent
 from api.services.guardrails import check_input, sanitize_output
 
 logger = logging.getLogger(__name__)
+
+# Query result cache — 5 minute TTL
+_query_cache = {}
+_CACHE_TTL = 300  # seconds
+
+
+def _get_cached(question: str) -> dict | None:
+    """Return cached result if same question asked within TTL."""
+    key = hashlib.md5(question.strip().lower().encode()).hexdigest()
+    cached = _query_cache.get(key)
+    if cached and time.time() - cached["timestamp"] < _CACHE_TTL:
+        logger.info(f"Cache hit for: {question[:50]}")
+        result = cached["result"].copy()
+        result["cached"] = True
+        return result
+    return None
+
+
+def _cache_result(question: str, result: dict):
+    """Store result in cache. Evict old entries if cache grows too large."""
+    key = hashlib.md5(question.strip().lower().encode()).hexdigest()
+    _query_cache[key] = {"result": result, "timestamp": time.time()}
+    # Evict oldest if cache > 100 entries
+    if len(_query_cache) > 100:
+        oldest_key = min(_query_cache, key=lambda k: _query_cache[k]["timestamp"])
+        del _query_cache[oldest_key]
 
 
 def _build_trace_step(tool: str, description: str, status: str = "done",
@@ -229,6 +256,13 @@ def route_query(question: str, conversation_history=None, session_context=None) 
     has_history = bool(conversation_history and len(conversation_history) > 0)
     check_input(question, has_conversation_history=has_history)
 
+    # Check cache (skip for follow-ups — they need fresh context)
+    if not has_history:
+        cached = _get_cached(question)
+        if cached:
+            cached["latency_ms"] = round((time.time() - start) * 1000, 1)
+            return cached
+
     # Resolve follow-up questions with conversation context BEFORE any routing
     resolved = _resolve_question_with_context(question, conversation_history, session_context)
 
@@ -268,5 +302,9 @@ def route_query(question: str, conversation_history=None, session_context=None) 
 
     if "latency_ms" not in result:
         result["latency_ms"] = round((time.time() - start) * 1000, 1)
+
+    # Cache result for identical future queries (skip follow-ups)
+    if not has_history and result.get("answer"):
+        _cache_result(question, result)
 
     return result
