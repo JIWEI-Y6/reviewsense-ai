@@ -1,109 +1,66 @@
 # ReviewSense AI
 
-## Overview
+## Project Overview
 
-ReviewSense AI is a Customer Review Insights Copilot built on Snowflake and GenAI. It analyzes Amazon product reviews to generate insights such as sentiment, themes, complaints, and improvement suggestions.
+ReviewSense-AI is an AI-powered Customer Review Insights Copilot built on Snowflake, dbt, FastAPI, Streamlit, and GenAI tools. It analyzes Amazon product reviews to generate actionable insights such as sentiment trends, major themes, common complaints, and product improvement suggestions.
+
+The goal of the project is to transform large volumes of unstructured customer review data into structured, useful business intelligence that supports faster analysis and better decision-making.
+
+---
 
 ## Problem
 
-Customer reviews are unstructured and difficult to analyze manually at scale.
+Customer reviews are highly unstructured and difficult to analyze manually at scale. Important signals such as recurring complaints, sentiment patterns, and product improvement opportunities are often buried in large volumes of raw review text.
+
+---
 
 ## Solution
 
-We built a Snowflake-based data pipeline and GenAI workflow to:
+We built an end-to-end review intelligence system that combines data engineering, analytics, and AI to:
 
 - Ingest and clean review data
-- Structure reviews for analytics
-- Enable embedding and RAG workflows
-- Generate product insights using Cortex LLM
+- Transform raw reviews into structured analytical models
+- Support analytics and insight generation
+- Generate AI-powered summaries and business insights
+- Deliver results through an interactive application interface
 
-## Architecture
+---
 
-Pipeline layers:
+## System Architecture
 
-RAW → CURATED → ANALYTICS → GenAI
+ReviewSense-AI connects the frontend, backend, data pipeline, and AI components in one end-to-end workflow. Users interact with the application through the Streamlit frontend, which sends requests to the FastAPI backend. The backend coordinates structured data from Snowflake and dbt with AI-powered analysis components to generate insights and return them to the user interface.
+
+**High-level flow:**  
+User → Streamlit Frontend → FastAPI Backend → Snowflake / dbt / AI Components → Streamlit Frontend
 
 ```mermaid
 flowchart TB
-    AIRFLOW["Apache Airflow (Orchestrator)"]
+    USER["User"]
+    UI["Streamlit Frontend"]
+    API["FastAPI Backend"]
+    SNOW["Snowflake"]
+    DBT["dbt Transformation Layer"]
+    AI["AI / Cortex"]
 
-    subgraph BRONZE["BRONZE LAYER"]
-        SOURCE["HuggingFace Amazon Reviews"]
-        STAGE["Snowflake Internal Stage"]
-        RAW["RAW_SCHEMA (VARIANT)"]
-    end
-
-    subgraph SILVER["SILVER LAYER"]
-        subgraph DBT_PIPELINE["dbt Pipeline"]
-            STAGING["Staging"]
-            TESTS1["Tests"]
-            INTERMEDIATE["Intermediate"]
-            TESTS2["Final Tests & Quality"]
-        end
-        DBT["dbt Cloud"]
-    end
-
-    subgraph GOLDEN["GOLDEN LAYER"]
-        CURATED["CURATED Schema"]
-        subgraph MARTS["Data Marts"]
-            INSIGHTS["Product Insights"]
-            EMBEDDINGS["Review Embeddings"]
-            ALERTS["Anomaly Alerts"]
-        end
-    end
-
-    subgraph AI["AI LAYER"]
-        subgraph AGENTS["AI Agents"]
-            RAG["RAG Q&A Agent"]
-            MONITOR["Monitoring Agent"]
-        end
-        CORTEX["Snowflake Cortex LLM"]
-    end
-
-    subgraph UI["INTERFACE"]
-        STREAMLIT["Streamlit Chat UI"]
-    end
-
-    AIRFLOW -.->|schedules| SOURCE
-    AIRFLOW -.->|triggers| DBT
-    AIRFLOW -.->|triggers| MONITOR
-
-    SOURCE --> STAGE
-    STAGE --> RAW
-
-    RAW --> STAGING
-    STAGING --> TESTS1
-    TESTS1 --> INTERMEDIATE
-    INTERMEDIATE --> TESTS2
-    DBT -.->|orchestrates| DBT_PIPELINE
-
-    TESTS2 --> CURATED
-    CURATED --> INSIGHTS
-    CURATED --> EMBEDDINGS
-    CURATED --> ALERTS
-
-    INSIGHTS --> RAG
-    EMBEDDINGS --> RAG
-    ALERTS --> MONITOR
-    CORTEX -.->|powers| AGENTS
-
-    RAG --> STREAMLIT
-    MONITOR --> STREAMLIT
+    USER --> UI
+    UI --> API
+    API --> SNOW
+    DBT --> API
+    API --> AI
+    AI --> API
+    API --> UI
+    
 ```
-| Layer | Technology | Purpose |
-|-------|------------|---------|
-| Data Source | HuggingFace Datasets | Amazon Reviews extraction |
-| File Format | Apache Parquet | Columnar, compressed storage |
-| Data Warehouse | Snowflake | Storage + Cortex AI |
-| Transformation | dbt | SQL modeling & testing |
-| Orchestration | Apache Airflow | Pipeline scheduling |
-| AI/ML | Snowflake Cortex | LLM & Embeddings |
+
 ## Tech Stack
 
-- Snowflake (Data Warehouse)
-- Snowflake Cortex AI
-- SQL
-- GitHub
+Frontend: Streamlit
+Backend: FastAPI
+Data Warehouse: Snowflake
+Transformation Layer: dbt
+AI Layer: Snowflake Cortex / GenAI components
+Programming / Query Language: Python, SQL
+Version Control: GitHub
 
 ## Current Progress
 
