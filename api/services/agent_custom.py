@@ -348,7 +348,7 @@ def _extract_json_from_response(response: str) -> dict | None:
     return None
 
 
-def _plan_tools(question: str, conversation_context: str = "") -> list[dict] | None:
+def _plan_tools(question: str, conversation_context: str = "", model: str | None = None) -> list[dict] | None:
     """Use COMPLETE to plan which tools to call.
 
     Resilient to LLM output variations:
@@ -378,15 +378,16 @@ def _plan_tools(question: str, conversation_context: str = "") -> list[dict] | N
     )
 
     try:
+        active_model = model or settings.llm_model
         with get_cursor() as cur:
             cur.execute(
                 "SELECT SNOWFLAKE.CORTEX.COMPLETE(%s, %s)",
-                (settings.llm_model, prompt)
+                (active_model, prompt)
             )
             response = cur.fetchone()[0].strip()
 
         # Log raw response for debugging
-        logger.info(f"Planning LLM response for '{question[:50]}': {response[:300]}")
+        logger.info(f"Planning LLM response ({active_model}) for '{question[:50]}': {response[:300]}")
 
         # Extract JSON from response (tries 4 strategies)
         plan = _extract_json_from_response(response)
@@ -535,7 +536,7 @@ TOOL_FALLBACK_STRATEGIES = {
 }
 
 
-def _execute_with_retry(step):
+def _execute_with_retry(step, model: str | None = None):
     """Execute a tool step. If empty, try rule-based fallback strategies.
 
     Safety: max 2 retries per step (one broaden + one switch_tool).
@@ -545,7 +546,7 @@ def _execute_with_retry(step):
     step["params"] = _validate_and_fix_params(step["tool"], step.get("params", {}))
 
     # First attempt
-    result = _execute_single_tool(step)
+    result = _execute_single_tool(step, model=model)
 
     if result and result.get("result") and not (isinstance(result["result"], dict) and result["result"].get("error")):
         return result  # Success
@@ -559,7 +560,7 @@ def _execute_with_retry(step):
             relaxed_params = {k: v for k, v in step["params"].items()
                            if k not in strategy["remove_params"]}
             retry_step = {**step, "params": relaxed_params}
-            result = _execute_single_tool(retry_step)
+            result = _execute_single_tool(retry_step, model=model)
 
         elif strategy["action"] == "switch_tool":
             query = (step["params"].get("query")
@@ -575,7 +576,7 @@ def _execute_with_retry(step):
                 "params": switch_params,
                 "purpose": f"Fallback for {step['tool']}"
             }
-            result = _execute_single_tool(switch_step)
+            result = _execute_single_tool(switch_step, model=model)
 
         if result and result.get("result") and not (isinstance(result["result"], dict) and result["result"].get("error")):
             result["retried"] = True
@@ -738,11 +739,20 @@ def _build_execution_waves(steps: list[dict]) -> list[list[int]]:
     return waves
 
 
-def _execute_single_tool(step: dict) -> dict:
+# Tools that accept an optional `model` kwarg (injected at execute time
+# so the candidate model flows end-to-end through the bake-off).
+_MODEL_AWARE_TOOLS = {"verify_claims"}
+
+
+def _execute_single_tool(step: dict, model: str | None = None) -> dict:
     """Execute a single tool in its own thread."""
     tool_name = step.get("tool")
-    params = step.get("params", {})
+    params = dict(step.get("params", {}))  # copy so we don't mutate the plan
     purpose = step.get("purpose", "")
+
+    # Inject the candidate model into tools that support it
+    if model and tool_name in _MODEL_AWARE_TOOLS:
+        params.setdefault("model", model)
 
     try:
         if tool_name == "query_analyst":
@@ -766,12 +776,15 @@ def _execute_single_tool(step: dict) -> dict:
         }
 
 
-def _execute_plan(steps: list[dict]) -> list[dict]:
+def _execute_plan(steps: list[dict], model: str | None = None) -> list[dict]:
     """Execute tools with parallel execution for independent steps.
 
     Groups steps into waves by dependency. Steps in the same wave
     run concurrently via ThreadPoolExecutor. Steps in later waves
     wait for their dependencies to complete.
+
+    The `model` param flows into model-aware tools (e.g., verify_claims)
+    so the candidate model is used end-to-end during a bake-off run.
 
     Adaptive: if a dependency returned empty/error, dependent steps are skipped.
     """
@@ -818,7 +831,7 @@ def _execute_plan(steps: list[dict]) -> list[dict]:
         # Single tool — no need for thread overhead
         if len(runnable) == 1:
             idx = runnable[0]
-            result = _execute_with_retry(steps[idx])
+            result = _execute_with_retry(steps[idx], model=model)
             result["wave"] = wave_num + 1
             all_results[idx] = result
             continue
@@ -828,7 +841,7 @@ def _execute_plan(steps: list[dict]) -> list[dict]:
         with ThreadPoolExecutor(max_workers=min(len(runnable), 4)) as executor:
             futures = {}
             for step_idx in runnable:
-                future = executor.submit(_execute_with_retry, steps[step_idx])
+                future = executor.submit(_execute_with_retry, steps[step_idx], model)
                 futures[future] = step_idx
 
             for future in as_completed(futures, timeout=30):
@@ -884,7 +897,7 @@ Tool results:
 Answer:"""
 
 
-def _synthesize(question: str, tool_results: list[dict], conversation_context: str = "") -> str:
+def _synthesize(question: str, tool_results: list[dict], conversation_context: str = "", model: str | None = None) -> str:
     """Generate final answer from all tool results."""
     # Build context from tool results
     context_parts = []
@@ -922,10 +935,11 @@ def _synthesize(question: str, tool_results: list[dict], conversation_context: s
     )
 
     try:
+        active_model = model or settings.llm_model
         with get_cursor() as cur:
             cur.execute(
                 "SELECT SNOWFLAKE.CORTEX.COMPLETE(%s, %s)",
-                (settings.llm_model, prompt)
+                (active_model, prompt)
             )
             return cur.fetchone()[0]
     except Exception as e:
@@ -956,7 +970,7 @@ Check these criteria and respond with ONLY valid JSON:
 }}"""
 
 
-def _reflect(question: str, answer: str, tool_results: list[dict]) -> dict:
+def _reflect(question: str, answer: str, tool_results: list[dict], model: str | None = None) -> dict:
     """Verify that the synthesized answer is grounded in tool results.
 
     Checks: Are all claims supported by data? Any hallucinated stats?
@@ -992,10 +1006,11 @@ def _reflect(question: str, answer: str, tool_results: list[dict]) -> dict:
     )
 
     try:
+        active_model = model or settings.llm_model
         with get_cursor() as cur:
             cur.execute(
                 "SELECT SNOWFLAKE.CORTEX.COMPLETE(%s, %s)",
-                (settings.llm_model, prompt)
+                (active_model, prompt)
             )
             response = cur.fetchone()[0].strip()
 
@@ -1107,7 +1122,7 @@ def _build_response(question: str, tool_results: list[dict], intent: str = "agen
 # MAIN ENTRY POINT
 # ============================================
 
-def run_custom_agent(question: str, conversation_history=None, session_context=None) -> dict:
+def run_custom_agent(question: str, conversation_history=None, session_context=None, model: str | None = None) -> dict:
     """Run the custom agentic RAG loop.
 
     Tiered:
@@ -1116,8 +1131,13 @@ def run_custom_agent(question: str, conversation_history=None, session_context=N
 
     Conversation-aware: uses conversation_history and session_context
     to plan better tools and generate coherent multi-turn answers.
+
+    Model override: if `model` is provided, it's used for all COMPLETE calls
+    in the agent path (planning, synthesis, reflection, verify_claims tool).
+    Otherwise, falls back to `settings.llm_model`. Used by the bake-off eval.
     """
     start = time.time()
+    active_model = model or settings.llm_model
 
     # Load dynamic dataset stats (cached, 1 hour TTL)
     _load_dataset_stats()
@@ -1129,8 +1149,6 @@ def run_custom_agent(question: str, conversation_history=None, session_context=N
     fast_result = _try_fast_path(question)
     if fast_result:
         # Still need synthesis for a natural answer
-        # Use the raw tool_results from _build_response's source data, not tool_trace
-        # tool_trace has display info (description, result_summary) but not raw results
         fast_tool_results = []
         for key in ["sql", "data", "sources"]:
             if fast_result.get(key):
@@ -1142,29 +1160,31 @@ def run_custom_agent(question: str, conversation_history=None, session_context=N
                 })
         if not fast_tool_results:
             fast_tool_results = [{"tool": "direct", "result": fast_result, "purpose": "Fast path", "status": "done"}]
-        answer = _synthesize(question, fast_tool_results, conversation_context=conv_context)
+        answer = _synthesize(question, fast_tool_results, conversation_context=conv_context, model=active_model)
         fast_result["answer"] = answer
+        fast_result["model"] = active_model
         fast_result["latency_ms"] = round((time.time() - start) * 1000, 1)
         return fast_result
 
     # Tier 2: LLM Planning
-    steps = _plan_tools(question, conversation_context=conv_context)
+    steps = _plan_tools(question, conversation_context=conv_context, model=active_model)
     if not steps:
         return None  # Signal to caller to use legacy fallback
 
     # Execute plan
-    tool_results = _execute_plan(steps)
+    tool_results = _execute_plan(steps, model=active_model)
 
     # Synthesize
-    answer = _synthesize(question, tool_results, conversation_context=conv_context)
+    answer = _synthesize(question, tool_results, conversation_context=conv_context, model=active_model)
 
     # Reflect — verify answer is grounded in tool results
-    reflection = _reflect(question, answer, tool_results)
+    reflection = _reflect(question, answer, tool_results, model=active_model)
 
     # Build response
     response = _build_response(question, tool_results)
     response["answer"] = answer
     response["reflection"] = reflection
+    response["model"] = active_model
     response["latency_ms"] = round((time.time() - start) * 1000, 1)
 
     # Add reflection to tool trace

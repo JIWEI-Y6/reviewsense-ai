@@ -554,7 +554,7 @@ def compare_products(asins: list[str]) -> dict:
 # TOOL 5: verify_claims
 # ============================================
 
-def verify_claims(asin: str) -> dict:
+def verify_claims(asin: str, model: str | None = None) -> dict:
     """Compare product metadata feature claims vs actual review evidence.
 
     For each feature claim in the metadata, searches reviews for evidence
@@ -562,10 +562,14 @@ def verify_claims(asin: str) -> dict:
 
     Args:
         asin: Amazon product ASIN
+        model: optional Cortex LLM override (e.g., 'llama3.1-70b'). Falls back
+               to settings.llm_model. Threaded in from the agent at execute time
+               so the candidate model is used end-to-end during bake-off runs.
 
     Returns:
         dict with 'product' info, 'claims' list with verdicts, 'overall_trust_score'
     """
+    active_model = model or settings.llm_model
     # Get product detail (includes features from metadata)
     product = get_product_detail(asin)
     if not product or not product.get("features"):
@@ -628,7 +632,7 @@ def verify_claims(asin: str) -> dict:
             try:
                 cur.execute(
                     "SELECT SNOWFLAKE.CORTEX.COMPLETE(%s, %s)",
-                    ("mistral-large", prompt)
+                    (active_model, prompt)
                 )
                 response = cur.fetchone()[0].strip()
                 # Try to parse JSON from response

@@ -24,8 +24,13 @@ class QueryRequest(BaseModel):
         default=None,
         description="Products, categories, and brands discussed in this session",
     )
+    model: str | None = Field(
+        default=None,
+        description="Cortex LLM model override (e.g., 'mistral-large', 'llama3.1-70b', 'snowflake-arctic'). "
+                    "When None, falls back to settings.llm_model. Used by the eval bake-off harness.",
+    )
 
-    model_config = {"json_schema_extra": {"examples": [
+    model_config = {"protected_namespaces": (), "json_schema_extra": {"examples": [
         {"question": "Which product categories have the worst reviews?"},
         {"question": "What do people complain about in headphones?"},
         {
@@ -39,6 +44,10 @@ class QueryRequest(BaseModel):
                 "categories_discussed": ["smart_home"],
                 "brands_discussed": ["Amazon"],
             },
+        },
+        {
+            "question": "What's the average rating for headphones?",
+            "model": "llama3.1-70b",
         },
     ]}}
 

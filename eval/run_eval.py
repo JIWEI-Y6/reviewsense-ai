@@ -10,13 +10,21 @@ Measures:
 7. Cost per query: estimated LLM calls × cost
 8. Fallback rate: % of queries where agent falls back to legacy router
 9. Tool utilization: which tools are called most often
+
+Multi-model bake-off:
+    python -m eval.run_eval --models mistral-large llama3.1-70b snowflake-arctic
+    python -m eval.run_eval --models llama3.1-70b --sample 20
+All candidates in one invocation share a RUN_ID in ANALYTICS.EVAL_RUNS.
+The judge model is held constant (mistral-large2) to avoid self-preference bias.
 """
 
+import argparse
 import json
 import os
 import re
 import sys
 import time
+import uuid
 from collections import Counter
 from datetime import datetime
 
@@ -30,6 +38,45 @@ from eval.test_questions import EVAL_QUESTIONS
 
 API_BASE = "http://localhost:8000"
 COST_PER_COMPLETE_CALL = 0.003  # Approximate cost for mistral-large on Snowflake
+
+# Judge held constant across candidates to eliminate self-preference bias.
+# mistral-large2 is not in the candidate bake-off set.
+JUDGE_MODEL = "mistral-large2"
+
+
+def _question_type(qid: str) -> str:
+    """Map question id prefix ('cat_01', 'prod_10', 'theme_15') to type."""
+    prefix = qid.split("_", 1)[0] if "_" in qid else qid
+    return {"cat": "category", "prod": "product", "theme": "theme"}.get(prefix, "unknown")
+
+
+def stratified_sample(questions: list[dict], n: int) -> list[dict]:
+    """Pick N questions preserving the category/product/theme ratio.
+
+    Original split is 30/40/30. For N=20 → 6/8/6.
+    """
+    if n >= len(questions):
+        return list(questions)
+    buckets: dict[str, list[dict]] = {}
+    for q in questions:
+        buckets.setdefault(_question_type(q["id"]), []).append(q)
+    total = sum(len(v) for v in buckets.values())
+    sample: list[dict] = []
+    for qtype, qs in buckets.items():
+        take = round(n * len(qs) / total)
+        sample.extend(qs[:max(1, take)])
+    # Trim/pad to exactly n
+    if len(sample) > n:
+        sample = sample[:n]
+    elif len(sample) < n:
+        # Pad with whatever questions weren't picked
+        seen = {q["id"] for q in sample}
+        for q in questions:
+            if q["id"] not in seen:
+                sample.append(q)
+                if len(sample) >= n:
+                    break
+    return sample
 
 
 def get_snowflake_cursor():
@@ -139,7 +186,7 @@ def judge_answer(question, answer, data_summary, cur):
     try:
         cur.execute(
             "SELECT SNOWFLAKE.CORTEX.COMPLETE(%s, %s)",
-            ("mistral-large", prompt)
+            (JUDGE_MODEL, prompt)
         )
         response = cur.fetchone()[0].strip()
 
@@ -200,20 +247,28 @@ def estimate_query_cost(api_response):
 # MAIN EVALUATION
 # ============================================
 
-def evaluate_question(q, cur):
-    """Evaluate a single question with all metrics."""
+def evaluate_question(q, cur, model: str | None = None):
+    """Evaluate a single question with all metrics.
+
+    If `model` is provided, it is passed through to /query so the agent uses
+    that Cortex LLM for planning, synthesis, reflection, and verify_claims.
+    """
     result = {
         "id": q["id"],
         "question": q["question"],
         "expected_intent": q["expected_intent"],
+        "candidate_model": model,
     }
 
     # Call the API
     start = time.time()
     try:
+        payload = {"question": q["question"]}
+        if model:
+            payload["model"] = model
         resp = requests.post(
             f"{API_BASE}/query",
-            json={"question": q["question"]},
+            json=payload,
             timeout=120,
         )
         latency = time.time() - start
@@ -339,27 +394,101 @@ def compute_percentile(values, percentile):
     return sorted_vals[min(idx, len(sorted_vals) - 1)]
 
 
-def main():
-    print("ReviewSense AI - Enhanced Evaluation Framework")
-    print(f"Running {len(EVAL_QUESTIONS)} questions against {API_BASE}")
-    print(f"Started: {datetime.now().isoformat()}")
+# ============================================
+# SNOWFLAKE PERSISTENCE (MealMind-inspired)
+# ============================================
+
+EVAL_RUNS_INSERT = """
+INSERT INTO ANALYTICS.EVAL_RUNS (
+    RUN_ID, RUN_TS, MODEL, JUDGE_MODEL, QUESTION_ID, QUESTION_TYPE, QUESTION_TEXT,
+    EXPECTED_INTENT, ACTUAL_INTENT, INTENT_CORRECT, DATA_CORRECT,
+    JUDGE_FACTUALITY, JUDGE_COMPLETENESS, JUDGE_CITATION, JUDGE_CONTEXT,
+    JUDGE_REASONING, IS_HALLUCINATION, LATENCY_MS, TOOLS_USED, FALLBACK_USED,
+    ANSWER_PREVIEW, MATCH_DETAIL, LLM_CALLS, ESTIMATED_COST
+)
+SELECT
+    %s, %s, %s, %s, %s, %s, %s,
+    %s, %s, %s, %s,
+    %s, %s, %s, %s,
+    %s, %s, %s, PARSE_JSON(%s), %s,
+    %s, %s, %s, %s
+"""
+
+
+def _truncate(s, n):
+    return (s or "")[:n]
+
+
+def persist_eval_runs(cur, run_id: str, run_ts, model: str, results: list[dict]):
+    """Insert per-question eval results into ANALYTICS.EVAL_RUNS.
+
+    Uses single-row INSERT … SELECT (needed for PARSE_JSON on the TOOLS_USED
+    ARRAY column). Snowflake's multi-row rewrite doesn't support expressions
+    in VALUES, so we loop — negligible at 20-100 rows per run.
+    """
+    inserted = 0
+    for r in results:
+        if r.get("api_error"):
+            continue
+        row = (
+            run_id, run_ts, model, JUDGE_MODEL,
+            r["id"], _question_type(r["id"]), _truncate(r.get("question"), 2000),
+            r.get("expected_intent"), _truncate(r.get("actual_intent"), 64),
+            bool(r.get("intent_correct")) if r.get("intent_correct") is not None else None,
+            bool(r.get("data_correct")) if r.get("data_correct") is not None else None,
+            r.get("judge_factuality"), r.get("judge_completeness"),
+            r.get("judge_citation_quality"), r.get("judge_context_utilization"),
+            _truncate(r.get("judge_reasoning"), 2000),
+            bool(r.get("is_hallucination")) if r.get("is_hallucination") is not None else None,
+            float(r.get("latency_s", 0)) * 1000.0,
+            json.dumps(r.get("tools_used") or []),
+            bool(r.get("fallback", False)),
+            _truncate(r.get("answer_preview"), 2000),
+            _truncate(r.get("match_detail"), 500),
+            r.get("llm_calls"), r.get("estimated_cost"),
+        )
+        cur.execute(EVAL_RUNS_INSERT, row)
+        inserted += 1
+    if inserted:
+        print(f"  Persisted {inserted} rows to ANALYTICS.EVAL_RUNS (run_id={run_id[:8]}...)")
+
+
+# ============================================
+# MAIN
+# ============================================
+
+def parse_args():
+    p = argparse.ArgumentParser(description="ReviewSense bake-off eval runner")
+    p.add_argument(
+        "--models", nargs="+", default=[None],
+        help="Candidate Cortex LLM(s) to evaluate. Default: use settings.llm_model. "
+             "Examples: --models mistral-large llama3.1-70b snowflake-arctic",
+    )
+    p.add_argument(
+        "--sample", type=int, default=None,
+        help="Stratified sample size (preserves cat/prod/theme ratio). Default: full 100.",
+    )
+    p.add_argument(
+        "--run-id", default=None,
+        help="Override run_id. Default: new uuid4 shared across all models.",
+    )
+    return p.parse_args()
+
+
+def run_single_model(model: str | None, questions: list[dict], cur, run_id: str) -> dict:
+    """Run the eval loop for one candidate model, return summary dict."""
+    model_label = model or "default"
+    print("\n" + "=" * 70)
+    print(f"MODEL: {model_label}")
     print("=" * 70)
 
-    # Check API is up
-    try:
-        health = requests.get(f"{API_BASE}/health", timeout=10)
-        print(f"API Health: {health.json()}")
-    except Exception:
-        print("ERROR: API is not running. Start it with: python -m uvicorn api.main:app")
-        sys.exit(1)
-
-    conn, cur = get_snowflake_cursor()
     results = []
     errors = 0
+    run_ts = datetime.now()
 
-    for i, q in enumerate(EVAL_QUESTIONS):
-        print(f"\n[{i+1}/{len(EVAL_QUESTIONS)}] {q['id']}: {q['question'][:60]}...")
-        result = evaluate_question(q, cur)
+    for i, q in enumerate(questions):
+        print(f"\n[{i+1}/{len(questions)}] ({model_label}) {q['id']}: {q['question'][:60]}...")
+        result = evaluate_question(q, cur, model=model)
         results.append(result)
 
         if result.get("api_error"):
@@ -379,7 +508,7 @@ def main():
     # ============================================
 
     evaluated_results = [r for r in results if not r.get("api_error")]
-    total = len(EVAL_QUESTIONS)
+    total = len(questions)
     evaluated = len(evaluated_results)
 
     # Core metrics
@@ -470,34 +599,40 @@ def main():
             print(f"  {intent}: {correct}/{len(subset)} intent acc, {avg_f:.1f} avg factuality")
 
     # ============================================
-    # SAVE RESULTS
+    # SAVE RESULTS + PERSIST TO SNOWFLAKE
     # ============================================
 
-    output_path = os.path.join(os.path.dirname(__file__), "eval_results.json")
+    summary = {
+        "total_questions": total,
+        "api_errors": errors,
+        "evaluated": evaluated,
+        "intent_accuracy": round(intent_correct / max(evaluated, 1), 4),
+        "data_correctness": round(data_correct / max(evaluated, 1), 4),
+        "avg_factuality": round(avg_factuality, 2),
+        "avg_completeness": round(avg_completeness, 2),
+        "avg_citation_quality": round(avg_citation, 2),
+        "avg_context_utilization": round(avg_context, 2),
+        "hallucination_rate": round(hallucination_rate, 4),
+        "hallucination_count": hallucinations,
+        "fallback_rate": round(fallback_rate, 4),
+        "fallback_count": fallbacks,
+        "latency_p50": round(latency_p50, 2),
+        "latency_p95": round(latency_p95, 2),
+        "latency_p99": round(latency_p99, 2),
+        "latency_avg": round(sum(latencies) / max(len(latencies), 1), 2),
+        "avg_cost_per_query": round(avg_cost, 4),
+        "total_eval_cost": round(total_cost, 2),
+    }
+
+    file_model_label = (model or "default").replace("/", "_").replace(" ", "_")
+    output_path = os.path.join(os.path.dirname(__file__), f"eval_results_{file_model_label}.json")
     with open(output_path, "w") as f:
         json.dump({
-            "timestamp": datetime.now().isoformat(),
-            "summary": {
-                "total_questions": total,
-                "api_errors": errors,
-                "evaluated": evaluated,
-                "intent_accuracy": round(intent_correct / max(evaluated, 1), 4),
-                "data_correctness": round(data_correct / max(evaluated, 1), 4),
-                "avg_factuality": round(avg_factuality, 2),
-                "avg_completeness": round(avg_completeness, 2),
-                "avg_citation_quality": round(avg_citation, 2),
-                "avg_context_utilization": round(avg_context, 2),
-                "hallucination_rate": round(hallucination_rate, 4),
-                "hallucination_count": hallucinations,
-                "fallback_rate": round(fallback_rate, 4),
-                "fallback_count": fallbacks,
-                "latency_p50": round(latency_p50, 2),
-                "latency_p95": round(latency_p95, 2),
-                "latency_p99": round(latency_p99, 2),
-                "latency_avg": round(sum(latencies) / max(len(latencies), 1), 2),
-                "avg_cost_per_query": round(avg_cost, 4),
-                "total_eval_cost": round(total_cost, 2),
-            },
+            "run_id": run_id,
+            "model": model,
+            "judge_model": JUDGE_MODEL,
+            "timestamp": run_ts.isoformat(),
+            "summary": summary,
             "tool_utilization": dict(tool_counter.most_common()),
             "path_distribution": dict(path_counter),
             "intent_breakdown": {
@@ -519,7 +654,72 @@ def main():
 
     print(f"\nDetailed results saved to: {output_path}")
 
-    conn.close()
+    # Persist to Snowflake (MealMind-inspired eval_logs pattern)
+    try:
+        persist_eval_runs(cur, run_id, run_ts, model or "default", results)
+    except Exception as e:
+        print(f"  WARN: Snowflake persistence failed: {e}")
+
+    return {"model": model, "summary": summary, "output_path": output_path}
+
+
+def main():
+    args = parse_args()
+
+    run_id = args.run_id or str(uuid.uuid4())
+    questions = list(EVAL_QUESTIONS)
+    if args.sample:
+        questions = stratified_sample(questions, args.sample)
+
+    print("ReviewSense AI — Bake-Off Evaluation")
+    print(f"Run ID:          {run_id}")
+    print(f"Judge model:     {JUDGE_MODEL}")
+    print(f"Candidates:      {', '.join(m or 'default' for m in args.models)}")
+    print(f"Questions:       {len(questions)} (of {len(EVAL_QUESTIONS)} total)")
+    print(f"Started:         {datetime.now().isoformat()}")
+    print("=" * 70)
+
+    # Check API is up
+    try:
+        health = requests.get(f"{API_BASE}/health", timeout=10)
+        print(f"API Health: {health.json()}")
+    except Exception:
+        print("ERROR: API is not running. Start it with: python -m uvicorn api.main:app")
+        sys.exit(1)
+
+    conn, cur = get_snowflake_cursor()
+    try:
+        bake_off_summary = []
+        for model in args.models:
+            try:
+                s = run_single_model(model, questions, cur, run_id)
+                bake_off_summary.append(s)
+            except Exception as e:
+                print(f"ERROR running {model or 'default'}: {e}")
+                bake_off_summary.append({"model": model, "error": str(e)[:300]})
+
+        # Final cross-model table (quick glance)
+        print("\n" + "=" * 70)
+        print("BAKE-OFF SUMMARY")
+        print("=" * 70)
+        print(f"{'Model':<22} {'Intent%':>8} {'Data%':>7} {'Fact':>5} {'Cite':>5} {'Hallu%':>7} {'P95s':>6}")
+        for s in bake_off_summary:
+            if "error" in s:
+                print(f"{(s['model'] or 'default'):<22} ERROR: {s['error'][:80]}")
+                continue
+            summ = s["summary"]
+            print(
+                f"{(s['model'] or 'default'):<22} "
+                f"{summ['intent_accuracy']*100:>7.1f}% "
+                f"{summ['data_correctness']*100:>6.1f}% "
+                f"{summ['avg_factuality']:>5.2f} "
+                f"{summ['avg_citation_quality']:>5.2f} "
+                f"{summ['hallucination_rate']*100:>6.1f}% "
+                f"{summ['latency_p95']:>5.1f}"
+            )
+        print(f"\nRun ID: {run_id}  —  query ANALYTICS.V_EVAL_MODEL_SUMMARY for details")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

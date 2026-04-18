@@ -234,17 +234,26 @@ def _legacy_route(question: str, conversation_history=None, session_context=None
     return result
 
 
-def route_query(question: str, conversation_history=None, session_context=None) -> dict:
-    """Process a user question through guardrails and the orchestrator."""
+def route_query(question: str, conversation_history=None, session_context=None, model: str | None = None) -> dict:
+    """Process a user question through guardrails and the orchestrator.
+
+    The optional `model` parameter overrides the default Cortex LLM used by the
+    custom agent (planning, synthesis, reflection, and eval-relevant tools).
+    Legacy fallback paths still use `settings.llm_model` — this is intentional,
+    since the bake-off measures the agent path, not the legacy path.
+    """
     start = time.time()
 
     # Input guardrail — skip off-topic check if mid-conversation
     has_history = bool(conversation_history and len(conversation_history) > 0)
     check_input(question, has_conversation_history=has_history)
 
+    # Cache key includes model so different candidates don't collide
+    cache_key = f"{model or ''}::{question}" if model else question
+
     # Check cache (skip for follow-ups — they need fresh context)
     if not has_history:
-        cached = _get_cached(question)
+        cached = _get_cached(cache_key)
         if cached:
             cached["latency_ms"] = round((time.time() - start) * 1000, 1)
             return cached
@@ -258,7 +267,12 @@ def route_query(question: str, conversation_history=None, session_context=None) 
     # Agent-first: try custom agent for ALL queries (new + follow-ups)
     try:
         from api.services.agent_custom import run_custom_agent
-        result = run_custom_agent(resolved, conversation_history=conversation_history, session_context=session_context)
+        result = run_custom_agent(
+            resolved,
+            conversation_history=conversation_history,
+            session_context=session_context,
+            model=model,
+        )
 
         if result and result.get("answer") and len(result["answer"].strip()) > 10:
             result["fallback"] = False
@@ -281,6 +295,6 @@ def route_query(question: str, conversation_history=None, session_context=None) 
 
     # Cache result for identical future queries (skip follow-ups)
     if not has_history and result.get("answer"):
-        _cache_result(question, result)
+        _cache_result(cache_key, result)
 
     return result

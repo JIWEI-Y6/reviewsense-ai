@@ -30,6 +30,7 @@ def query(request: Request, body: QueryRequest):
             body.question,
             conversation_history=body.conversation_history,
             session_context=body.session_context,
+            model=body.model,
         )
         return QueryResponse(**result)
     except GuardrailError as e:
