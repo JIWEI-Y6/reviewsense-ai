@@ -1,9 +1,31 @@
-"""Monitoring service: reads alerts and runs on-demand anomaly scans."""
+"""Monitoring service: reads alerts, runs on-demand anomaly scans, and sends email alerts."""
 
 import json
+import logging
 from datetime import datetime
 from api.db import get_cursor
 from api.config import settings
+
+logger = logging.getLogger(__name__)
+
+ALERT_EMAIL = "ganta.r@northeastern.edu"
+NOTIFICATION_INTEGRATION = "reviewsense_email"
+
+
+def send_alert_email(subject: str, body: str) -> bool:
+    """Send an email alert via Snowflake SYSTEM$SEND_EMAIL."""
+    try:
+        with get_cursor() as cur:
+            cur.execute(
+                "CALL SYSTEM$SEND_EMAIL(%s, %s, %s, %s)",
+                (NOTIFICATION_INTEGRATION, ALERT_EMAIL,
+                 f"[ReviewSenseAI] {subject}", body)
+            )
+            logger.info(f"Alert email sent: {subject}")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to send alert email: {e}")
+        return False
 
 
 def get_alerts(
@@ -174,6 +196,29 @@ def run_anomaly_scan() -> dict:
             for r in cur.fetchall()
         ]
 
+        # Send email alert for HIGH severity anomalies
+        high_anomalies = [a for a in anomalies if a["severity"] == "HIGH"]
+        failed_quality = [q for q in quality if q["status"] == "FAIL"]
+
+        if high_anomalies or failed_quality:
+            alert_lines = []
+            if high_anomalies:
+                alert_lines.append(f"HIGH SEVERITY ANOMALIES ({len(high_anomalies)}):")
+                for a in high_anomalies[:5]:
+                    alert_lines.append(
+                        f"  - {a['anomaly_type']} in {a['derived_category']}: "
+                        f"deviation {a.get('deviation_score', 'N/A')}"
+                    )
+            if failed_quality:
+                alert_lines.append(f"\nFAILED DATA QUALITY CHECKS ({len(failed_quality)}):")
+                for q in failed_quality:
+                    alert_lines.append(f"  - {q['check_name']}: {q['description']}")
+
+            send_alert_email(
+                f"Anomaly Scan: {len(high_anomalies)} HIGH alerts, {len(failed_quality)} quality failures",
+                "\n".join(alert_lines)
+            )
+
         return {
             "anomalies_detected": len(anomalies),
             "anomalies": anomalies,
@@ -181,6 +226,7 @@ def run_anomaly_scan() -> dict:
             "emerging_themes": emerging,
             "product_anomalies": products,
             "data_quality": quality,
+            "email_sent": bool(high_anomalies or failed_quality),
             "generated_at": datetime.now().isoformat(),
         }
 

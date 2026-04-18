@@ -31,6 +31,9 @@ class QueryResponse(BaseModel):
     fallback: bool = False
     cached: bool = False
     latency_ms: float
+    model: str | None = None
+
+    model_config = {"protected_namespaces": ()}
 
 
 class CategorySummary(BaseModel):

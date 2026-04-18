@@ -19,6 +19,23 @@ sources:
           - name: LOADED_AT
             description: Timestamp when row was ingested
 
+  - name: curated
+    database: REVIEWSENSE_DB
+    schema: CURATED
+    tables:
+      - name: PRODUCT_METADATA
+        description: >
+          McAuley Electronics metadata. 786K products with title, brand, price,
+          features, category. 25K ASINs overlap with review dataset.
+        columns:
+          - name: ASIN
+          - name: TITLE
+          - name: BRAND
+          - name: PRICE
+          - name: FEATURES_TEXT
+          - name: CATEGORY_PATH
+          - name: ALSO_BUY
+
   # Legacy source — kept for reference/backward compatibility
   - name: analytics
     database: REVIEWSENSE_DB

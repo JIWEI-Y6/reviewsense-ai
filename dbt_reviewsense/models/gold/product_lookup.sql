@@ -96,12 +96,30 @@ parsed_names AS (
     FROM final_names
 )
 
+-- Deduplicate metadata (some ASINs appear twice in the source)
+, deduped_metadata AS (
+    SELECT *
+    FROM (
+        SELECT *,
+            ROW_NUMBER() OVER (PARTITION BY ASIN ORDER BY PRICE DESC NULLS LAST) AS rn
+        FROM {{ source('curated', 'PRODUCT_METADATA') }}
+    )
+    WHERE rn = 1
+)
+
 SELECT
     e.ASIN,
     e.DERIVED_CATEGORY,
     e.REVIEW_COUNT,
     e.DERIVATION_CONFIDENCE,
-    p.BRAND,
-    p.PRODUCT_NAME
+    COALESCE(m.BRAND, p.BRAND) AS BRAND,
+    COALESCE(m.TITLE, p.PRODUCT_NAME) AS PRODUCT_NAME,
+    m.TITLE AS METADATA_TITLE,
+    m.BRAND AS METADATA_BRAND,
+    m.PRICE AS METADATA_PRICE,
+    m.FEATURES_TEXT AS METADATA_FEATURES,
+    m.CATEGORY_PATH AS METADATA_CATEGORY_PATH,
+    CASE WHEN m.ASIN IS NOT NULL THEN TRUE ELSE FALSE END AS HAS_METADATA
 FROM extracted e
 LEFT JOIN parsed_names p ON e.ASIN = p.ASIN
+LEFT JOIN deduped_metadata m ON e.ASIN = m.ASIN

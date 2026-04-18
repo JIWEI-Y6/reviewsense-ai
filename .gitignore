@@ -27,6 +27,14 @@ data/asins_to_scrape.txt
 # Eval results (regenerated per run)
 eval/eval_results.json
 
+# Chat/session exports (contain full private transcripts — never commit)
+chat_export.md
+conversation_export.md
+
+# Office temp lock files
+~$*.pptx
+~$*.docx
+
 # IDE
 .vscode/
 .idea/

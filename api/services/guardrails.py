@@ -131,8 +131,14 @@ def _is_on_topic(question_lower: str) -> bool:
                 return True
 
     # Check dynamic brands (e.g., "logitech", "sony")
+    # Use word boundary matching to avoid "ast" matching "pasta"
+    # Exclude common English words that happen to be brand names
+    _brand_stopwords = {"make", "made", "the", "one", "all", "now", "go", "can",
+                        "get", "has", "had", "was", "are", "and", "not", "set", "run"}
     for brand in _dynamic_keywords["brands"]:
-        if brand in question_lower and len(brand) > 2:  # Skip very short brand names
+        if (len(brand) > 2
+                and brand not in _brand_stopwords
+                and re.search(rf'\b{re.escape(brand)}\b', question_lower)):
             return True
 
     # Check dynamic themes (e.g., "battery life", "sound quality")

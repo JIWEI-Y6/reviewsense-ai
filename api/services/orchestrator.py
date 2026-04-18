@@ -56,59 +56,45 @@ def _build_trace_step(tool: str, description: str, status: str = "done",
 
 
 def _resolve_question_with_context(question: str, conversation_history=None, session_context=None) -> str:
-    """Resolve follow-up questions using conversation history.
+    """Tag follow-up questions with a lightweight topic hint.
 
-    If the question looks like a follow-up (short, uses pronouns, references 'it'/'they'),
-    prepend context from recent conversation so the downstream tools understand what's being asked.
+    Detects follow-up signals (pronouns, short questions) and prepends a brief
+    topic hint from the last assistant message. Actual entity resolution (which
+    products "both of them" refers to) is handled by the LLM planner, which
+    receives full entity context via _format_conversation_context.
     """
     if not conversation_history:
         return question
 
     q = question.lower()
     followup_signals = ['it', 'they', 'them', 'this', 'that', 'those', 'the same',
-                        'how about', 'what about', 'and the', 'also', 'its', 'their']
+                        'how about', 'what about', 'and the', 'also', 'its', 'their',
+                        'both', 'each of them', 'all of them']
 
     has_signal = any(f' {s} ' in f' {q} ' for s in followup_signals)
     is_very_short = len(question.split()) <= 3  # "how much?", "is it good?"
 
-    # Only treat as follow-up if it has explicit follow-up signals,
-    # or is extremely short (3 words or less = almost certainly a follow-up)
-    is_followup = has_signal or is_very_short
-
-    if not is_followup:
+    if not has_signal and not is_very_short:
         return question
 
-    # Find the most recent topic from conversation
-    last_topic = ""
-    last_product = ""
+    # Find a brief topic hint from the last assistant message
     for msg in reversed(conversation_history):
         role = msg.role if hasattr(msg, 'role') else msg.get('role', '')
         content = msg.content if hasattr(msg, 'content') else msg.get('content', '')
-        if role == "assistant":
-            import re
-            asin_match = re.search(r'\bB0[A-Z0-9]{8,}\b', content)
-            if asin_match:
-                last_product = asin_match.group(0)
-            if not last_topic:
-                last_topic = content[:200]
-            break
-        elif role == "user":
-            if not last_topic and len(content) > 10:
-                last_topic = content
+        if role == "assistant" and len(content) > 20:
+            topic_hint = content[:100]
+            return f"Follow-up on: {topic_hint}. Question: {question}"
 
-    # Build a clean, self-contained rewritten question
-    if last_product:
-        return f"Regarding product {last_product}: {question}"
-    elif last_topic:
-        # Use session context for product/brand references
-        if session_context and session_context.products_discussed:
-            product = session_context.products_discussed[-1]
-            return f"Regarding product {product}: {question}"
-        elif session_context and session_context.brands_discussed:
-            brand = session_context.brands_discussed[-1]
-            return f"Regarding {brand} products: {question}"
-        else:
-            return f"In the context of: {last_topic[:100]}. {question}"
+    # Fallback: session context entities (when no conversation history text)
+    if session_context:
+        products = getattr(session_context, 'products_discussed', None) or \
+                   (session_context.get('products_discussed') if isinstance(session_context, dict) else None) or []
+        brands = getattr(session_context, 'brands_discussed', None) or \
+                 (session_context.get('brands_discussed') if isinstance(session_context, dict) else None) or []
+        if products:
+            return f"Regarding product {products[-1]}: {question}"
+        if brands:
+            return f"Regarding {brands[-1]} products: {question}"
 
     return question
 
@@ -248,17 +234,26 @@ def _legacy_route(question: str, conversation_history=None, session_context=None
     return result
 
 
-def route_query(question: str, conversation_history=None, session_context=None) -> dict:
-    """Process a user question through guardrails and the orchestrator."""
+def route_query(question: str, conversation_history=None, session_context=None, model: str | None = None) -> dict:
+    """Process a user question through guardrails and the orchestrator.
+
+    The optional `model` parameter overrides the default Cortex LLM used by the
+    custom agent (planning, synthesis, reflection, and eval-relevant tools).
+    Legacy fallback paths still use `settings.llm_model` — this is intentional,
+    since the bake-off measures the agent path, not the legacy path.
+    """
     start = time.time()
 
     # Input guardrail — skip off-topic check if mid-conversation
     has_history = bool(conversation_history and len(conversation_history) > 0)
     check_input(question, has_conversation_history=has_history)
 
+    # Cache key includes model so different candidates don't collide
+    cache_key = f"{model or ''}::{question}" if model else question
+
     # Check cache (skip for follow-ups — they need fresh context)
     if not has_history:
-        cached = _get_cached(question)
+        cached = _get_cached(cache_key)
         if cached:
             cached["latency_ms"] = round((time.time() - start) * 1000, 1)
             return cached
@@ -266,23 +261,18 @@ def route_query(question: str, conversation_history=None, session_context=None) 
     # Resolve follow-up questions with conversation context BEFORE any routing
     resolved = _resolve_question_with_context(question, conversation_history, session_context)
 
-    # If this is a follow-up (resolved != original), skip agent and use legacy directly
-    # The agent doesn't handle contextual questions well
     if resolved != question:
-        logger.info(f"Follow-up detected. Resolved: {resolved[:100]}")
-        # Pass resolved question, None for history so _legacy_route doesn't re-resolve
-        result = _legacy_route(resolved, None, None)
-        result["fallback"] = False  # Not a fallback — intentional routing
-        if result.get("answer"):
-            result["answer"] = sanitize_output(result["answer"])
-        if "latency_ms" not in result:
-            result["latency_ms"] = round((time.time() - start) * 1000, 1)
-        return result
+        logger.info(f"Follow-up resolved: {resolved[:100]}")
 
-    # Try custom agent loop first (our tools), then legacy as fallback
+    # Agent-first: try custom agent for ALL queries (new + follow-ups)
     try:
         from api.services.agent_custom import run_custom_agent
-        result = run_custom_agent(resolved)
+        result = run_custom_agent(
+            resolved,
+            conversation_history=conversation_history,
+            session_context=session_context,
+            model=model,
+        )
 
         if result and result.get("answer") and len(result["answer"].strip()) > 10:
             result["fallback"] = False
@@ -305,6 +295,6 @@ def route_query(question: str, conversation_history=None, session_context=None) 
 
     # Cache result for identical future queries (skip follow-ups)
     if not has_history and result.get("answer"):
-        _cache_result(question, result)
+        _cache_result(cache_key, result)
 
     return result

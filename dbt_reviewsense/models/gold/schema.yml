@@ -3,14 +3,47 @@ version: 2
 models:
   - name: product_lookup
     description: >
-      ASIN to derived product category mapping. One row per ASIN.
-      Only includes ASINs with 3+ reviews.
+      ASIN to derived product category mapping with optional real metadata.
+      One row per ASIN. Only includes ASINs with 3+ reviews.
+      Real metadata (title, brand, price, features) available for ~3,477 ASINs
+      from McAuley dataset; LLM-derived names for the rest.
     columns:
       - name: ASIN
         tests:
           - unique
           - not_null
       - name: DERIVED_CATEGORY
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - headphones_earbuds
+                  - speakers
+                  - streaming_devices
+                  - smart_home
+                  - cables_adapters
+                  - chargers_batteries
+                  - phone_accessories
+                  - computer_peripherals
+                  - storage_media
+                  - cameras_accessories
+                  - tv_accessories
+                  - gaming_accessories
+                  - wearables
+                  - other_electronics
+      - name: REVIEW_COUNT
+        tests:
+          - not_null
+      - name: DERIVATION_CONFIDENCE
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['high', 'medium', 'low']
+      - name: BRAND
+      - name: PRODUCT_NAME
+      - name: HAS_METADATA
         tests:
           - not_null
 
@@ -23,6 +56,20 @@ models:
         tests:
           - unique
           - not_null
+      - name: ASIN
+        tests:
+          - not_null
+      - name: RATING
+        tests:
+          - not_null
+      - name: DERIVED_CATEGORY
+        description: "From product_lookup LEFT JOIN — NULL for ASINs with <3 reviews"
+        tests:
+          - relationships:
+              to: ref('product_lookup')
+              field: DERIVED_CATEGORY
+              config:
+                where: "DERIVED_CATEGORY IS NOT NULL"
 
   - name: category_sentiment_summary
     description: >
@@ -32,6 +79,18 @@ models:
       - name: DERIVED_CATEGORY
         tests:
           - unique
+          - not_null
+      - name: AVG_RATING
+        tests:
+          - not_null
+      - name: AVG_SENTIMENT
+        tests:
+          - not_null
+      - name: REVIEW_COUNT
+        tests:
+          - not_null
+      - name: NEGATIVE_RATE
+        tests:
           - not_null
 
   - name: category_monthly_trends
@@ -43,11 +102,32 @@ models:
     description: >
       Tier 2 aggregation: product-level stats for ASINs with 20+ reviews only.
       NOT included in Cortex Analyst — accessed via direct SQL.
+    columns:
+      - name: ASIN
+        tests:
+          - unique
+          - not_null
+      - name: AVG_RATING
+        tests:
+          - not_null
+      - name: REVIEW_COUNT
+        tests:
+          - not_null
 
   - name: theme_category_analysis
     description: >
       Tier 3 cross-analysis: theme x category breakdown.
       For Cortex Analyst semantic model.
+    columns:
+      - name: DERIVED_CATEGORY
+        tests:
+          - not_null
+      - name: REVIEW_THEME
+        tests:
+          - not_null
+      - name: REVIEW_COUNT
+        tests:
+          - not_null
 
   - name: complaint_analysis
     description: >

@@ -347,8 +347,11 @@ if page == "Intelligence Chat":
                             intent.split(" ")[0] if intent else "", "🤖")
                         st.caption(f"{intent_icon} {intent}  |  {latency:.0f}ms")
 
-                    # Data table for structured queries
-                    if meta.get("data") and isinstance(meta["data"], list) and len(meta["data"]) > 0:
+                    # Data table only for structured SQL queries (not agent tool results)
+                    intent = meta.get("intent", "")
+                    if (meta.get("data") and isinstance(meta["data"], list) and len(meta["data"]) > 0
+                            and meta.get("sql")
+                            and "agent" not in intent):
                         data_df = pd.DataFrame(meta["data"])
                         st.dataframe(
                             data_df,
@@ -379,7 +382,9 @@ if page == "Intelligence Chat":
             for msg in st.session_state.chat_history[-6:]:
                 if msg["role"] in ("user", "assistant"):
                     content = msg.get("content", "")
-                    history.append({"role": msg["role"], "content": content[:500]})
+                    # Assistant messages get more room — entity extraction needs full product details
+                    max_len = 1500 if msg["role"] == "assistant" else 500
+                    history.append({"role": msg["role"], "content": content[:max_len]})
 
             payload = {
                 "question": question,
@@ -949,3 +954,4 @@ elif page == "Monitoring & Alerts":
                         )
         else:
             st.error(f"Analysis failed: {analysis.get('error', 'Unknown error')}")
+

@@ -6,8 +6,37 @@ All tools return structured dicts — the agent synthesizes the final answer.
 """
 
 import json
+import re
 from api.db import get_cursor
 from api.config import settings
+
+
+_BRACKET_TAG_RE = re.compile(r'\[[^\]]{1,40}\]')
+
+
+def clean_product_name(raw: str | None, max_len: int = 80) -> str | None:
+    """Strip Amazon title markup (e.g. '[2-Pack]', '[Apple MFi Certified]') and truncate."""
+    if not raw:
+        return raw
+    s = _BRACKET_TAG_RE.sub('', raw)
+    s = re.sub(r'\s{2,}', ' ', s).strip(' ,-')
+    if len(s) > max_len:
+        s = s[:max_len].rsplit(' ', 1)[0] + '…'
+    return s
+
+
+BRAND_ALIASES = {
+    "amazon basics": "amazonbasics",
+    "amazon-basics": "amazonbasics",
+    "amazonbasic": "amazonbasics",
+    "amazon-basic": "amazonbasics",
+}
+
+
+def _normalize_brand(brand: str) -> str:
+    """Map common brand-name variants to the canonical form stored in metadata."""
+    key = brand.strip().lower()
+    return BRAND_ALIASES.get(key, key)
 
 
 # ============================================
@@ -42,8 +71,16 @@ def search_reviews(
         limit: Max results (default 5)
 
     Returns:
-        dict with 'results' (list of review dicts) and 'query_info' (filter summary)
+        dict with 'results' (list of review dicts) and 'query_info' (filter summary).
+        When asin+theme are both set, also returns 'theme_stats' with aggregate
+        numbers (total reviews, avg sentiment, avg rating, positive/negative %)
+        so synthesis answers stay consistent with prior aggregate turns.
     """
+    # A 5-review sample is unrepresentative of a large themed population
+    # (e.g. 412 reviews tagged battery_life). Bump default when theme is set.
+    if theme and limit == 5:
+        limit = 15
+
     # Build filter object for Cortex Search
     filters = {}
     if asin:
@@ -147,8 +184,43 @@ def search_reviews(
                 "quality": r.get("REVIEW_QUALITY", ""),
             })
 
-        return {
+        # Enrich results with product names from PRODUCT_LOOKUP
+        unique_asins = list({r["asin"] for r in results if r.get("asin")})
+        product_names = {}
+        if unique_asins:
+            placeholders = ", ".join(["%s"] * len(unique_asins))
+            cur.execute(f"""
+                SELECT ASIN,
+                       COALESCE(METADATA_TITLE, PRODUCT_NAME) AS PRODUCT_NAME,
+                       COALESCE(METADATA_BRAND, BRAND) AS BRAND
+                FROM GOLD.PRODUCT_LOOKUP
+                WHERE ASIN IN ({placeholders})
+            """, unique_asins)
+            for row in cur.fetchall():
+                product_names[row[0]] = {"product_name": row[1], "brand": row[2]}
+
+        # Add product name/brand to each result
+        for r in results:
+            info = product_names.get(r["asin"], {})
+            r["product_name"] = info.get("product_name")
+            r["brand"] = info.get("brand")
+
+        # Aggregate by ASIN — shows which products appear most in results
+        from collections import Counter
+        asin_counts = Counter(r["asin"] for r in results if r.get("asin"))
+        product_mentions = []
+        for asin_val, count in asin_counts.most_common(5):
+            info = product_names.get(asin_val, {})
+            product_mentions.append({
+                "asin": asin_val,
+                "product_name": info.get("product_name"),
+                "brand": info.get("brand"),
+                "mention_count": count,
+            })
+
+        response = {
             "results": results,
+            "product_mentions": product_mentions,
             "query_info": {
                 "query": query,
                 "filters_applied": {k: v for k, v in {
@@ -159,6 +231,34 @@ def search_reviews(
                 "result_count": len(results),
             },
         }
+
+        # Theme aggregate — keeps follow-up answers consistent with prior turns
+        # when the user asks about a specific theme on a specific product.
+        if asin and theme:
+            cur.execute("""
+                SELECT
+                    COUNT(*)                     AS total,
+                    AVG(SENTIMENT_SCORE)         AS avg_sentiment,
+                    AVG(RATING)                  AS avg_rating,
+                    SUM(CASE WHEN SENTIMENT_SCORE > 0.2  THEN 1 ELSE 0 END) AS positive,
+                    SUM(CASE WHEN SENTIMENT_SCORE < -0.2 THEN 1 ELSE 0 END) AS negative
+                FROM GOLD.ENRICHED_REVIEWS
+                WHERE ASIN = %s AND REVIEW_THEME = %s
+            """, (asin, theme))
+            stats = cur.fetchone()
+            if stats and stats[0] and stats[0] > 0:
+                total = stats[0]
+                response["theme_stats"] = {
+                    "asin": asin,
+                    "theme": theme,
+                    "total_reviews": total,
+                    "avg_sentiment": round(float(stats[1] or 0), 3),
+                    "avg_rating": round(float(stats[2] or 0), 2),
+                    "positive_pct": round(float(stats[3] or 0) / total, 3),
+                    "negative_pct": round(float(stats[4] or 0) / total, 3),
+                }
+
+        return response
 
 
 # ============================================
@@ -288,11 +388,13 @@ def search_products(
     min_reviews: int = 5,
     sort_by: str = "review_count",
     limit: int = 10,
+    review_theme: str | None = None,
 ) -> dict:
-    """Search products by metadata criteria: price, features, brand, category, rating.
+    """Search products by metadata criteria: price, features, brand, category, rating, theme.
 
     Queries CURATED.PRODUCT_METADATA joined with GOLD.PRODUCT_SENTIMENT_SUMMARY
-    for review stats. Pure SQL — no Cortex functions at query time.
+    for review stats. When review_theme is specified, joins ENRICHED_REVIEWS to find
+    products with positive reviews about that theme. Pure SQL — no Cortex functions.
 
     Args:
         category: Derived category filter (e.g., 'headphones_earbuds')
@@ -302,8 +404,10 @@ def search_products(
         features_contain: Keyword to search in product features (e.g., 'waterproof', 'noise cancelling')
         min_rating: Minimum average rating
         min_reviews: Minimum review count (default 5)
-        sort_by: Sort field — 'review_count', 'avg_rating', 'price', 'avg_sentiment'
+        sort_by: Sort field — 'review_count', 'avg_rating', 'price', 'avg_sentiment', 'theme_sentiment'
         limit: Max results (default 10)
+        review_theme: Filter to products with reviews about this theme (e.g., 'comfort', 'battery_life').
+                       Ranked by positive sentiment on that theme.
 
     Returns:
         dict with 'products' list and 'search_criteria' summary
@@ -330,6 +434,25 @@ def search_products(
         conditions.append("s.AVG_RATING >= %s")
         params.append(min_rating)
 
+    # Theme-based filtering: join ENRICHED_REVIEWS to find products with reviews about a theme
+    theme_join = ""
+    theme_select = ""
+    if review_theme:
+        theme_join = """
+            INNER JOIN (
+                SELECT ASIN,
+                       COUNT(*) AS theme_review_count,
+                       ROUND(AVG(SENTIMENT_SCORE), 3) AS theme_avg_sentiment,
+                       ROUND(AVG(RATING), 2) AS theme_avg_rating
+                FROM GOLD.ENRICHED_REVIEWS
+                WHERE REVIEW_THEME = %s AND SENTIMENT_SCORE > 0
+                GROUP BY ASIN
+                HAVING COUNT(*) >= 2
+            ) t ON p.ASIN = t.ASIN
+        """
+        theme_select = ", t.theme_review_count, t.theme_avg_sentiment, t.theme_avg_rating"
+        params.append(review_theme)
+
     where_clause = " AND ".join(conditions)
 
     sort_map = {
@@ -337,7 +460,11 @@ def search_products(
         "avg_rating": "s.AVG_RATING DESC NULLS LAST",
         "price": "m.PRICE ASC NULLS LAST",
         "avg_sentiment": "s.AVG_SENTIMENT DESC NULLS LAST",
+        "theme_sentiment": "t.theme_avg_sentiment DESC NULLS LAST" if review_theme else "s.AVG_SENTIMENT DESC NULLS LAST",
     }
+    # Default to theme_sentiment when filtering by theme
+    if review_theme and sort_by == "review_count":
+        sort_by = "theme_sentiment"
     order_by = sort_map.get(sort_by, "p.REVIEW_COUNT DESC")
 
     with get_cursor() as cur:
@@ -354,9 +481,11 @@ def search_products(
                 s.NEGATIVE_RATE,
                 s.TOP_THEME,
                 m.FEATURES_TEXT AS FEATURES_STR
+                {theme_select}
             FROM GOLD.PRODUCT_LOOKUP p
             LEFT JOIN CURATED.PRODUCT_METADATA m ON p.ASIN = m.ASIN
             LEFT JOIN GOLD.PRODUCT_SENTIMENT_SUMMARY s ON p.ASIN = s.ASIN
+            {theme_join}
             WHERE {where_clause}
             ORDER BY {order_by}
             LIMIT {limit}
@@ -364,7 +493,7 @@ def search_products(
 
         products = []
         for r in cur.fetchall():
-            products.append({
+            product = {
                 "asin": r[0],
                 "product_name": r[1],
                 "brand": r[2],
@@ -376,7 +505,12 @@ def search_products(
                 "negative_rate": float(r[8]) if r[8] else None,
                 "top_theme": r[9],
                 "features": r[10][:300] if r[10] else None,
-            })
+            }
+            if review_theme:
+                product["theme_review_count"] = r[11]
+                product["theme_avg_sentiment"] = float(r[12]) if r[12] else None
+                product["theme_avg_rating"] = float(r[13]) if r[13] else None
+            products.append(product)
 
         return {
             "products": products,
@@ -385,7 +519,7 @@ def search_products(
                 "min_price": min_price, "max_price": max_price,
                 "features_contain": features_contain,
                 "min_rating": min_rating, "min_reviews": min_reviews,
-                "sort_by": sort_by,
+                "sort_by": sort_by, "review_theme": review_theme,
             }.items() if v is not None},
             "result_count": len(products),
         }
@@ -485,7 +619,7 @@ def compare_products(asins: list[str]) -> dict:
 # TOOL 5: verify_claims
 # ============================================
 
-def verify_claims(asin: str) -> dict:
+def verify_claims(asin: str, model: str | None = None) -> dict:
     """Compare product metadata feature claims vs actual review evidence.
 
     For each feature claim in the metadata, searches reviews for evidence
@@ -493,10 +627,14 @@ def verify_claims(asin: str) -> dict:
 
     Args:
         asin: Amazon product ASIN
+        model: optional Cortex LLM override (e.g., 'llama3.1-70b'). Falls back
+               to settings.llm_model. Threaded in from the agent at execute time
+               so the candidate model is used end-to-end during bake-off runs.
 
     Returns:
         dict with 'product' info, 'claims' list with verdicts, 'overall_trust_score'
     """
+    active_model = model or settings.llm_model
     # Get product detail (includes features from metadata)
     product = get_product_detail(asin)
     if not product or not product.get("features"):
@@ -559,7 +697,7 @@ def verify_claims(asin: str) -> dict:
             try:
                 cur.execute(
                     "SELECT SNOWFLAKE.CORTEX.COMPLETE(%s, %s)",
-                    ("mistral-large", prompt)
+                    (active_model, prompt)
                 )
                 response = cur.fetchone()[0].strip()
                 # Try to parse JSON from response
@@ -809,54 +947,94 @@ def find_similar_products(asin: str, limit: int = 5) -> dict:
         if not also_buy or not isinstance(also_buy, list):
             return {"source_asin": asin, "similar_products": [], "note": "No also_buy data."}
 
-        # Get details for similar products that exist in our dataset
-        placeholders = ", ".join(["%s"] * min(len(also_buy), 20))
+        # Source category — filter same-category matches first so we don't surface
+        # cross-category co-purchases (e.g. Lightning adapter for a headphones query).
+        source = get_product_detail(asin)
+        source_category = source.get("category") if source else None
+
         params = also_buy[:20]
+        placeholders = ", ".join(["%s"] * len(params))
 
-        cur.execute(f"""
-            SELECT
-                p.ASIN,
-                COALESCE(p.METADATA_TITLE, p.PRODUCT_NAME) AS PRODUCT_NAME,
-                COALESCE(p.METADATA_BRAND, p.BRAND) AS BRAND,
-                m.PRICE,
-                p.DERIVED_CATEGORY,
-                s.REVIEW_COUNT,
-                s.AVG_RATING,
-                s.AVG_SENTIMENT
-            FROM GOLD.PRODUCT_LOOKUP p
-            LEFT JOIN CURATED.PRODUCT_METADATA m ON p.ASIN = m.ASIN
-            LEFT JOIN GOLD.PRODUCT_SENTIMENT_SUMMARY s ON p.ASIN = s.ASIN
-            WHERE p.ASIN IN ({placeholders})
-            ORDER BY s.REVIEW_COUNT DESC NULLS LAST
-            LIMIT {limit}
-        """, params)
-
-        similar = [
-            {
+        def _row_to_dict(r, related=False):
+            return {
                 "asin": r[0],
-                "product_name": r[1],
+                "product_name": clean_product_name(r[1]),
+                "full_title": r[1],
                 "brand": r[2],
                 "price": float(r[3]) if r[3] else None,
                 "category": r[4],
                 "review_count": r[5],
                 "avg_rating": float(r[6]) if r[6] else None,
                 "avg_sentiment": float(r[7]) if r[7] else None,
+                "related_category": related,
             }
-            for r in cur.fetchall()
-        ]
 
-        # Get source product info
-        source = get_product_detail(asin)
+        similar: list[dict] = []
+
+        # Pass 1: same-category matches
+        if source_category:
+            cur.execute(f"""
+                SELECT
+                    p.ASIN,
+                    COALESCE(p.METADATA_TITLE, p.PRODUCT_NAME) AS PRODUCT_NAME,
+                    COALESCE(p.METADATA_BRAND, p.BRAND) AS BRAND,
+                    m.PRICE,
+                    p.DERIVED_CATEGORY,
+                    s.REVIEW_COUNT,
+                    s.AVG_RATING,
+                    s.AVG_SENTIMENT
+                FROM GOLD.PRODUCT_LOOKUP p
+                LEFT JOIN CURATED.PRODUCT_METADATA m ON p.ASIN = m.ASIN
+                LEFT JOIN GOLD.PRODUCT_SENTIMENT_SUMMARY s ON p.ASIN = s.ASIN
+                WHERE p.ASIN IN ({placeholders})
+                  AND p.DERIVED_CATEGORY = %s
+                ORDER BY s.REVIEW_COUNT DESC NULLS LAST
+                LIMIT {limit}
+            """, params + [source_category])
+            similar = [_row_to_dict(r, related=False) for r in cur.fetchall()]
+
+        # Pass 2: top up with cross-category co-purchases if we have empty slots.
+        # These get flagged related_category=True so the agent can label them.
+        if len(similar) < limit:
+            remaining = limit - len(similar)
+            exclude_asins = [s["asin"] for s in similar]
+            exclude_placeholders = ", ".join(["%s"] * len(exclude_asins)) if exclude_asins else "''"
+            where_category = "p.DERIVED_CATEGORY != %s" if source_category else "1=1"
+            cat_params = [source_category] if source_category else []
+
+            cur.execute(f"""
+                SELECT
+                    p.ASIN,
+                    COALESCE(p.METADATA_TITLE, p.PRODUCT_NAME) AS PRODUCT_NAME,
+                    COALESCE(p.METADATA_BRAND, p.BRAND) AS BRAND,
+                    m.PRICE,
+                    p.DERIVED_CATEGORY,
+                    s.REVIEW_COUNT,
+                    s.AVG_RATING,
+                    s.AVG_SENTIMENT
+                FROM GOLD.PRODUCT_LOOKUP p
+                LEFT JOIN CURATED.PRODUCT_METADATA m ON p.ASIN = m.ASIN
+                LEFT JOIN GOLD.PRODUCT_SENTIMENT_SUMMARY s ON p.ASIN = s.ASIN
+                WHERE p.ASIN IN ({placeholders})
+                  AND {where_category}
+                  AND p.ASIN NOT IN ({exclude_placeholders})
+                ORDER BY s.REVIEW_COUNT DESC NULLS LAST
+                LIMIT {remaining}
+            """, params + cat_params + (exclude_asins if exclude_asins else ['']))
+            similar.extend(_row_to_dict(r, related=True) for r in cur.fetchall())
 
         return {
             "source": {
                 "asin": asin,
-                "name": source.get("product_name") if source else None,
+                "name": clean_product_name(source.get("product_name")) if source else None,
                 "brand": source.get("brand") if source else None,
+                "category": source_category,
             },
             "similar_products": similar,
             "total_also_buy": len(also_buy),
             "matched_in_dataset": len(similar),
+            "same_category_count": sum(1 for s in similar if not s["related_category"]),
+            "related_category_count": sum(1 for s in similar if s["related_category"]),
         }
 
 
